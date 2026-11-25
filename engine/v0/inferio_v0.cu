@@ -148,7 +148,7 @@ __global__ void embed_kernel(const int32_t *__restrict__ ids, const __half *__re
     int d = (int)(i % D);
     int si = t / seq;
     int p = t - si * seq;
-    int id = ids[si];
+    int id = ids[(long)si * seq + p];
     x[i] = __float2half(__half2float(wte[(long)id * D + d]) + __half2float(wpe[(long)p * D + d]));
 }
 
