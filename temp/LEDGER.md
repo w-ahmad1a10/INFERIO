@@ -190,3 +190,49 @@ entry verbatim from the result JSONs of record in `temp/results/`.
 - **Group tweak (128 for B<=256, 64 above):** A/B at B=256 showed group 128 is 5..6% SLOWER than 64 (v12 3774/3788 vs v09 3606/3572) — group 64 wins at 256 too; the official v0.9-run mid-batch regression was session noise. Tweak reverted; group 64 everywhere.
 - **Scale fold (v0.12.2):** Q pre-scaled by 1/sqrt(64)*log2(e) at load, removing 32 multiplies per thread per tile. A/B at B=1024: attention phase -2..3% consistently, total a wash. Accepted (parity PASS, max diff 0.237 vs 0.115 — extra fp16 rounding, argmax identical).
 - **Official v0.12.2 run:** within noise of v0.9.0 at every batch (B=1024: 14321.5 vs 14291.4 ms). Caveat: this run was at 1035 MHz SM clock vs 900-915 MHz for v0.9.0's official run, so cross-session deltas are clock-inflated; the same-session A/B (wash overall, attention -2..3%) is the valid comparison. Champions: v0.9.0/v0.12.2 config.
+
+## Run `20261125-182650Z-pytorch-eager-nocache` — PyTorch eager-nocache GPT-2 fp16 — GPU 1
+- torch 2.11.0+cu130, harness sha256 659b0ef99014289a…
+- **Note:** PyTorch eager fp16, use_cache=False (no KV allocation), identical frozen inputs — reference baseline only, not the engine.
+- device env: 0, Tesla T4, 580.178.04, 15360 MiB, 300 MHz, 39; 1, Tesla T4, 580.178.04, 15360 MiB, 1275 MHz, 67
+
+| B | status | median ms | min ms | max ms | tokens/s |
+|---|--------|-----------|--------|--------|----------|
+| 1 | ok | 23.75 | 22.90 | 23.80 | 43114.6 |
+| 4 | ok | 57.49 | 56.97 | 58.21 | 71241.2 |
+| 16 | ok | 225.99 | 225.28 | 230.37 | 72497.9 |
+| 32 | ok | 454.32 | 452.93 | 460.02 | 72125.7 |
+| 64 | ok | 916.64 | 912.09 | 923.78 | 71495.6 |
+| 128 | ok | 1934.46 | 1887.37 | 1950.26 | 67756.3 |
+| 256 | ok | 4197.23 | 4162.53 | 4334.41 | 62456.5 |
+| 512 | oom | – | – | – | – |
+| 1024 | oom | – | – | – | – |
+
+## Run `20261125-182800Z-pytorch-compile` — PyTorch compile GPT-2 fp16 — GPU 1
+- torch 2.11.0+cu130, harness sha256 659b0ef99014289a…
+- **Note:** PyTorch torch.compile(transformer, dynamic=True) fp16, use_cache=False — reference baseline only, not the engine.
+- device env: 0, Tesla T4, 580.178.04, 15360 MiB, 300 MHz, 37; 1, Tesla T4, 580.178.04, 15360 MiB, 1200 MHz, 71
+
+| B | status | median ms | min ms | max ms | tokens/s |
+|---|--------|-----------|--------|--------|----------|
+| 1 | ok | 20.55 | 16.63 | 20.67 | 49839.3 |
+| 4 | ok | 57.90 | 56.70 | 60.23 | 70741.4 |
+| 16 | ok | 242.54 | 241.68 | 242.70 | 67552.7 |
+| 32 | ok | 486.52 | 485.02 | 489.65 | 67352.2 |
+| 64 | ok | 1006.96 | 995.27 | 1018.92 | 65083.3 |
+| 128 | ok | 2209.43 | 2179.42 | 2263.69 | 59323.9 |
+| 256 | ok | 5211.07 | 5054.00 | 5544.67 | 50305.2 |
+| 512 | oom | – | – | – | – |
+| 1024 | oom | – | – | – | – |
+
+## Run `20261125-183113Z-pytorch-compile` — PyTorch compile GPT-2 fp16 — GPU 1
+- torch 2.11.0+cu130, harness sha256 dc5707627d5a8f3a…
+- **Note:** torch.compile specialized (no dynamic), screening subset — reference baseline only, not the engine.
+- device env: 0, Tesla T4, 580.178.04, 15360 MiB, 300 MHz, 38; 1, Tesla T4, 580.178.04, 15360 MiB, 1080 MHz, 80
+
+| B | status | median ms | min ms | max ms | tokens/s |
+|---|--------|-----------|--------|--------|----------|
+| 16 | ok | 241.82 | 241.21 | 242.21 | 67753.9 |
+| 64 | ok | 997.38 | 988.01 | 1010.77 | 65707.9 |
+| 256 | ok | 5003.26 | 4726.01 | 5659.44 | 52394.6 |
+
