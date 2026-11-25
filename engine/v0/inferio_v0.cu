@@ -384,159 +384,159 @@ __global__ void attn_kernel_simple(const __half *__restrict__ qkv, __half *__res
     for (int d = 0; d < kHeadDim; ++d) ob[d] = __float2half(acc[d] * inv);
 }
 
-// Tensor-core flash attention (two-pass: QK for row max, then QK again + PV).
-// Br = 64 queries per CTA (4 warps x 16 rows), Bc = 64 keys per tile, head_dim 64.
-// Scores/p rows are staged in shared memory because WMMA fragments are opaque.
-#define kAttnBr 64
-#define kAttnBc 64
-#define kAttnStride 72
-#define kAttnSmemBytes (4 * 64 * kAttnStride * 2 + 64 * kAttnStride * 4 + 2 * 64 * 4)
+// Tensor-core attention via inline PTX mma.sync.m16n8k8 (f16 in, f32 accum).
+// One warp handles 16 queries; a block (4 warps) handles 64 queries. Keys are
+// processed in 64-key tiles; scores stay in registers — the QK result layout of
+// mma.m16n8k8 is exactly the A-operand layout needed for the PV matmul, so the
+// softmax probabilities are re-packed in registers with no shared-memory trip.
+// Fragment mapping (PTX ISA): lane -> g = lane/4 (row), t = lane%4 (col pair).
+//   A(16x8,row): regs {A[g][2t],A[g][2t+1]}, {A[g+8][2t],A[g+8][2t+1]}
+//   B(8x8,col):  reg  {B[2t][g],B[2t+1][g]}
+//   C/D(16x8):   regs rows g/g+8, cols 2t/2t+1
+__device__ __forceinline__ void mma_f16(float d[4], unsigned a0, unsigned a1, unsigned b0) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+}
 
-__global__ void attn_wmma_kernel(const __half *__restrict__ qkv, __half *__restrict__ out,
-                                 int seq, float scale_log2e) {
-    extern __shared__ char smem_raw[];
-    __half *Qs = reinterpret_cast<__half *>(smem_raw);
-    __half *Ks = Qs + 64 * kAttnStride;
-    __half *Vs = Ks + 64 * kAttnStride;
-    __half *Ps = Vs + 64 * kAttnStride;
-    float *S = reinterpret_cast<float *>(Ps + 64 * kAttnStride);
-    float *rowmax = S + 64 * kAttnStride;
-    float *rowsum = rowmax + 64;
+__device__ __forceinline__ unsigned pack_half2(float x, float y) {
+    __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<unsigned *>(&h);
+}
 
-    const int qc = blockIdx.x;
-    const int h = blockIdx.y;
-    const int g = blockIdx.z;
+__global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restrict__ out,
+                                int seq, float scale_log2e) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row0 = warp * 16;
-    const int qbase_row = qc * kAttnBr + row0;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int qc = blockIdx.x;
+    const int h = blockIdx.y;
+    const int gseq = blockIdx.z;
     const long row_stride = kQKV;
-    const __half *qkv_g = qkv + (long)g * seq * row_stride + h * kHeadDim;
+    const __half *qkv_g = qkv + (long)gseq * seq * row_stride + h * kHeadDim;
 
-    for (int i = threadIdx.x; i < kAttnBr * kHeadDim; i += blockDim.x) {
-        const int r = i / kHeadDim, d = i % kHeadDim;
-        Qs[r * kAttnStride + d] = qkv_g[(long)(qc * kAttnBr + r) * row_stride + d];
-    }
-    if (threadIdx.x < kAttnBr) {
-        rowmax[threadIdx.x] = -1e30f;
-        rowsum[threadIdx.x] = 0.f;
-    }
-    __syncthreads();
+    const int qrow0 = qc * 64 + warp * 16;
+    const int r = qrow0 + g;
+    const int r8 = r + 8;
 
-    const int qmax = min(qc * kAttnBr + kAttnBr - 1, seq - 1);
-    const int n_tiles = (qmax + kAttnBc) / kAttnBc;
-
-    using namespace nvcuda;
-
-    // Pass A: row max of scaled scores.
-    for (int t = 0; t < n_tiles; ++t) {
-        const int k0 = t * kAttnBc;
-        for (int i = threadIdx.x; i < kAttnBc * kHeadDim; i += blockDim.x) {
-            const int kk = i / kHeadDim, d = i % kHeadDim;
-            Ks[kk * kAttnStride + d] = qkv_g[(long)(k0 + kk) * row_stride + kD + d];
+    unsigned qa[8][2];
+    {
+        const __half *p0 = qkv_g + (long)r * row_stride;
+        const __half *p8 = qkv_g + (long)r8 * row_stride;
+#pragma unroll
+        for (int dch = 0; dch < 8; ++dch) {
+            qa[dch][0] = *reinterpret_cast<const unsigned *>(p0 + dch * 8 + t * 2);
+            qa[dch][1] = *reinterpret_cast<const unsigned *>(p8 + dch * 8 + t * 2);
         }
-        __syncthreads();
-
-        fragment<accumulator, 16, 16, 16, float> c[4];
-        for (int nk = 0; nk < 4; ++nk) {
-            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
-            fragment<matrix_b, 16, 16, 16, __half, col_major> b;
-            wmma::fill_fragment(c[nk], 0.f);
-            for (int dch = 0; dch < 4; ++dch) {
-                wmma::load_matrix_sync(a, &Qs[row0 * kAttnStride + dch * 16], kAttnStride);
-                wmma::load_matrix_sync(b, &Ks[(nk * 16) * kAttnStride + dch * 16], kAttnStride);
-                wmma::mma_sync(c[nk], a, b, c[nk]);
-            }
-            wmma::store_matrix_sync(&S[row0 * kAttnStride + nk * 16], c[nk], kAttnStride,
-                                    mem_row_major);
-        }
-        __syncthreads();
-
-        if (lane < 16) {
-            const int row = row0 + lane;
-            const int qrow = qc * kAttnBr + row;
-            float m = rowmax[row];
-            for (int kk = 0; kk < kAttnBc; ++kk) {
-                if (k0 + kk > qrow) break;
-                const float s = S[row * kAttnStride + kk] * scale_log2e;
-                S[row * kAttnStride + kk] = s;
-                m = fmaxf(m, s);
-            }
-            rowmax[row] = m;
-        }
-        __syncthreads();
     }
 
-    fragment<accumulator, 16, 16, 16, float> o[4];
-    for (int i = 0; i < 4; ++i) wmma::fill_fragment(o[i], 0.f);
+    float o[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; ++n)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) o[n][i] = 0.f;
 
-    // Pass B: p = exp2(s - m2), accumulate l and O = P @ V.
-    for (int t = 0; t < n_tiles; ++t) {
-        const int k0 = t * kAttnBc;
-        for (int i = threadIdx.x; i < kAttnBc * kHeadDim; i += blockDim.x) {
-            const int kk = i / kHeadDim, d = i % kHeadDim;
-            const long krow = (long)(k0 + kk) * row_stride;
-            Ks[kk * kAttnStride + d] = qkv_g[krow + kD + d];
-            Vs[kk * kAttnStride + d] = qkv_g[krow + 2 * kD + d];
-        }
-        __syncthreads();
+    float m_r = -1e30f, m_r8 = -1e30f;
+    float l_r = 0.f, l_r8 = 0.f;
 
-        fragment<accumulator, 16, 16, 16, float> c[4];
-        for (int nk = 0; nk < 4; ++nk) {
-            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
-            fragment<matrix_b, 16, 16, 16, __half, col_major> b;
-            wmma::fill_fragment(c[nk], 0.f);
-            for (int dch = 0; dch < 4; ++dch) {
-                wmma::load_matrix_sync(a, &Qs[row0 * kAttnStride + dch * 16], kAttnStride);
-                wmma::load_matrix_sync(b, &Ks[(nk * 16) * kAttnStride + dch * 16], kAttnStride);
-                wmma::mma_sync(c[nk], a, b, c[nk]);
-            }
-            wmma::store_matrix_sync(&S[row0 * kAttnStride + nk * 16], c[nk], kAttnStride,
-                                    mem_row_major);
-        }
-        __syncthreads();
+    const int qmax = qrow0 + 15;
+    const int n_tiles = (qmax + 64) / 64;
 
-        if (lane < 16) {
-            const int row = row0 + lane;
-            const int qrow = qc * kAttnBr + row;
-            const float m2 = rowmax[row];
-            float l = 0.f;
-            for (int kk = 0; kk < kAttnBc; ++kk) {
-                float p = 0.f;
-                if (k0 + kk <= qrow) {
-                    p = exp2f(S[row * kAttnStride + kk] * scale_log2e - m2);
-                    l += p;
-                }
-                Ps[row * kAttnStride + kk] = __float2half(p);
-            }
-            rowsum[row] += l;
-        }
-        __syncthreads();
-
-        for (int kc = 0; kc < 4; ++kc) {
-            fragment<matrix_a, 16, 16, 16, __half, row_major> pa;
-            wmma::load_matrix_sync(pa, &Ps[row0 * kAttnStride + kc * 16], kAttnStride);
-            for (int n = 0; n < 4; ++n) {
-                fragment<matrix_b, 16, 16, 16, __half, row_major> vb;
-                wmma::load_matrix_sync(vb, &Vs[(kc * 16) * kAttnStride + n * 16], kAttnStride);
-                wmma::mma_sync(o[n], pa, vb, o[n]);
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        const int k0 = tile * 64;
+        float c[8][4];
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) c[kg][i] = 0.f;
+            const __half *kb = qkv_g + (long)(k0 + kg * 8 + g) * row_stride + kD;
+#pragma unroll
+            for (int dch = 0; dch < 8; ++dch) {
+                const unsigned b0 = *reinterpret_cast<const unsigned *>(kb + dch * 8 + t * 2);
+                mma_f16(c[kg], qa[dch][0], qa[dch][1], b0);
             }
         }
-        __syncthreads();
+
+        float tmax_r = -1e30f, tmax_r8 = -1e30f;
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+            const int col = k0 + kg * 8 + t * 2;
+            c[kg][0] *= scale_log2e;
+            c[kg][1] *= scale_log2e;
+            c[kg][2] *= scale_log2e;
+            c[kg][3] *= scale_log2e;
+            if (col > r) c[kg][0] = -1e30f;
+            if (col + 1 > r) c[kg][1] = -1e30f;
+            if (col > r8) c[kg][2] = -1e30f;
+            if (col + 1 > r8) c[kg][3] = -1e30f;
+            tmax_r = fmaxf(tmax_r, fmaxf(c[kg][0], c[kg][1]));
+            tmax_r8 = fmaxf(tmax_r8, fmaxf(c[kg][2], c[kg][3]));
+        }
+        tmax_r = fmaxf(tmax_r, __shfl_xor_sync(0xffffffffu, tmax_r, 1));
+        tmax_r = fmaxf(tmax_r, __shfl_xor_sync(0xffffffffu, tmax_r, 2));
+        tmax_r8 = fmaxf(tmax_r8, __shfl_xor_sync(0xffffffffu, tmax_r8, 1));
+        tmax_r8 = fmaxf(tmax_r8, __shfl_xor_sync(0xffffffffu, tmax_r8, 2));
+
+        const float mn_r = fmaxf(m_r, tmax_r);
+        const float mn_r8 = fmaxf(m_r8, tmax_r8);
+        const float corr_r = exp2f(m_r - mn_r);
+        const float corr_r8 = exp2f(m_r8 - mn_r8);
+
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            o[n][0] *= corr_r;
+            o[n][1] *= corr_r;
+            o[n][2] *= corr_r8;
+            o[n][3] *= corr_r8;
+        }
+
+        unsigned pa[8][2];
+        float sum_r = 0.f, sum_r8 = 0.f;
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+            const float p0 = exp2f(c[kg][0] - mn_r);
+            const float p1 = exp2f(c[kg][1] - mn_r);
+            const float p2 = exp2f(c[kg][2] - mn_r8);
+            const float p3 = exp2f(c[kg][3] - mn_r8);
+            sum_r += p0 + p1;
+            sum_r8 += p2 + p3;
+            pa[kg][0] = pack_half2(p0, p1);
+            pa[kg][1] = pack_half2(p2, p3);
+        }
+        sum_r += __shfl_xor_sync(0xffffffffu, sum_r, 1);
+        sum_r += __shfl_xor_sync(0xffffffffu, sum_r, 2);
+        sum_r8 += __shfl_xor_sync(0xffffffffu, sum_r8, 1);
+        sum_r8 += __shfl_xor_sync(0xffffffffu, sum_r8, 2);
+        l_r = l_r * corr_r + sum_r;
+        l_r8 = l_r8 * corr_r8 + sum_r8;
+        m_r = mn_r;
+        m_r8 = mn_r8;
+
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                const __half *vb = qkv_g + (long)(k0 + kg * 8 + t * 2) * row_stride + 2 * kD +
+                                   n * 8 + g;
+                __half2 h2 = __halves2half2(vb[0], vb[row_stride]);
+                const unsigned b0 = *reinterpret_cast<unsigned *>(&h2);
+                mma_f16(o[n], pa[kg][0], pa[kg][1], b0);
+            }
+        }
     }
 
-    for (int n = 0; n < 4; ++n)
-        wmma::store_matrix_sync(&S[row0 * kAttnStride + n * 16], o[n], kAttnStride,
-                                mem_row_major);
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < kAttnBr * kHeadDim; i += blockDim.x) {
-        const int r = i / kHeadDim, d = i % kHeadDim;
-        const int qrow = qc * kAttnBr + r;
-        if (qrow >= seq) continue;
-        const float inv = rowsum[r] > 0.f ? 1.f / rowsum[r] : 0.f;
-        out[(long)(g * seq + qrow) * kD + h * kHeadDim + d] =
-            __float2half(S[r * kAttnStride + d] * inv);
+    const float inv_r = l_r > 0.f ? 1.f / l_r : 0.f;
+    const float inv_r8 = l_r8 > 0.f ? 1.f / l_r8 : 0.f;
+    __half *orow = out + (long)gseq * seq * kD + h * kHeadDim;
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+        orow[(long)r * kD + n * 8 + t * 2] = __float2half(o[n][0] * inv_r);
+        orow[(long)r * kD + n * 8 + t * 2 + 1] = __float2half(o[n][1] * inv_r);
+        orow[(long)r8 * kD + n * 8 + t * 2] = __float2half(o[n][2] * inv_r8);
+        orow[(long)r8 * kD + n * 8 + t * 2 + 1] = __float2half(o[n][3] * inv_r8);
     }
 }
 
@@ -947,18 +947,9 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     g_attn_mode = 0;
     if (aenv) {
         if (std::strcmp(aenv, "tiled") == 0) g_attn_mode = 1;
-        else if (std::strcmp(aenv, "wmma") == 0) g_attn_mode = 2;
+        else if (std::strcmp(aenv, "mma") == 0) g_attn_mode = 2;
     }
-    if (g_attn_mode == 2) {
-        cudaError_t e = cudaFuncSetAttribute((const void *)attn_wmma_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             kAttnSmemBytes);
-        if (e != cudaSuccess) {
-            g_attn_mode = 0;
-            cudaGetLastError();
-        }
-    }
-    const char *attn_names[3] = {"simple", "tiled", "wmma"};
+    const char *attn_names[3] = {"simple", "tiled", "mma"};
     std::printf("INFERIO_INIT attn=%s\n", attn_names[g_attn_mode]);
     std::fflush(stdout);
 
@@ -1040,9 +1031,8 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
             if (g_attn_mode == 2) {
-                dim3 wgrid((seqlen + kAttnBr - 1) / kAttnBr, kHeads, gn);
-                attn_wmma_kernel<<<wgrid, 128, kAttnSmemBytes>>>(g_m.qkv, g_m.att, seqlen,
-                                                                 attn_scale_log2e);
+                dim3 mgrid((seqlen + 63) / 64, kHeads, gn);
+                attn_mma_kernel<<<mgrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             } else if (g_attn_mode == 1) {
                 dim3 agrid((seqlen + 127) / 128, kHeads, gn);
                 attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
