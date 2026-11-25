@@ -495,6 +495,21 @@ static int ensure_buffers(int batch, int seqlen) {
     return 0;
 }
 
+// ------------------------------------------------------------ debug dumps --
+// INFERIO_DUMP_DIR=<dir> dumps group-0 intermediates for bit-level debugging.
+static void dump_tensor(const char *name, const void *dev, size_t bytes) {
+    const char *dir = std::getenv("INFERIO_DUMP_DIR");
+    if (!dir) return;
+    std::vector<char> h(bytes);
+    if (cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    char path[1024];
+    std::snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE *f = std::fopen(path, "wb");
+    if (!f) return;
+    std::fwrite(h.data(), 1, bytes, f);
+    std::fclose(f);
+}
+
 // ------------------------------------------------------------- public API ---
 extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     g_err.clear();
@@ -566,6 +581,7 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             embed_kernel<<<blocks, 256>>>(g_m.ids_dev + (size_t)g0 * seqlen, wte->dev, wpe->dev,
                                           g_m.x, total, seqlen, kD);
             prof_end(ph);
+            if (g0 == 0) dump_tensor("01_embed_x", g_m.x, (size_t)tr * kD * 2);
         }
 
         for (int l = 0; l < kNLayers; ++l) {
@@ -587,6 +603,7 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             int ph = prof_begin(INFERIO_PHASE_LN);
             ln_kernel<256><<<(int)tr, 256>>>(g_m.x, ln1w->dev, ln1b->dev, g_m.xn, kD, 1e-5f);
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("02_ln1_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_QKV);
             CUBLAS_CK(gemm_xw(g_m.xn, qkvw->dev, g_m.qkv, tr, kD, kQKV, 0.0f));
@@ -596,11 +613,13 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                                                                      kQKV);
             }
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
             dim3 agrid((seqlen + 127) / 128, kHeads, gn);
             attn_kernel<<<agrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale);
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_PROJ);
             CUBLAS_CK(gemm_xw(g_m.att, pw->dev, g_m.x, tr, kD, kD, 1.0f));
@@ -609,10 +628,12 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                 bias_add_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.x, pb->dev, total, kD);
             }
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("05_proj_x", g_m.x, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_LN);
             ln_kernel<256><<<(int)tr, 256>>>(g_m.x, ln2w->dev, ln2b->dev, g_m.xn, kD, 1e-5f);
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("06_ln2_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC1);
             CUBLAS_CK(gemm_xw(g_m.xn, f1w->dev, g_m.ffn, tr, kD, kFF, 0.0f));
@@ -622,6 +643,7 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                                                                       kFF);
             }
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("07_fc1_gelu", g_m.ffn, (size_t)tr * kFF * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC2);
             CUBLAS_CK(gemm_xw(g_m.ffn, f2w->dev, g_m.x, tr, kFF, kD, 1.0f));
@@ -630,11 +652,13 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                 bias_add_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.x, f2b->dev, total, kD);
             }
             prof_end(ph);
+            if (g0 == 0 && l == 0) dump_tensor("08_fc2_x", g_m.x, (size_t)tr * kD * 2);
         }
 
         int ph = prof_begin(INFERIO_PHASE_LN);
         ln_kernel<256><<<(int)tr, 256>>>(g_m.x, lnf_w->dev, lnf_b->dev, g_m.xn, kD, 1e-5f);
         prof_end(ph);
+        if (g0 == 0) dump_tensor("09_final_xn", g_m.xn, (size_t)tr * kD * 2);
 
         ph = prof_begin(INFERIO_PHASE_HEAD);
         gather_last_kernel<<<gn, 128>>>(g_m.xn, g_m.hlast, g0, seqlen, kD);
@@ -648,6 +672,8 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
         cast_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.logits16, g_m.logits32, total);
     }
     prof_end(ph);
+    dump_tensor("10_hlast", g_m.hlast, (size_t)batch * kD * 2);
+    dump_tensor("11_logits32", g_m.logits32, (size_t)batch * kVocab * 4);
 
     CUDA_CK(cudaEventRecord(g_ev1, 0));
     {
