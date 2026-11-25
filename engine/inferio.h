@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define INFERIO_VERSION "v0.4.0"
+#define INFERIO_VERSION "v0.5.0"
 
 typedef enum {
     INFERIO_OK = 0,

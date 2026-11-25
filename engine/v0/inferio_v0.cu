@@ -249,6 +249,14 @@ __global__ void bias_gelu_kernel(__half *__restrict__ y, const __half *__restric
     y2[i] = __floats2half2_rn(gelu_new(f.x + bf.x), gelu_new(f.y + bf.y));
 }
 
+__global__ void gelu_kernel(__half *__restrict__ y, long total2) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total2) return;
+    __half2 *y2 = reinterpret_cast<__half2 *>(y);
+    float2 f = __half22float2(y2[i]);
+    y2[i] = __floats2half2_rn(gelu_new(f.x), gelu_new(f.y));
+}
+
 // One thread per query row; tiled online softmax in log2 domain (exp2f), one
 // accumulator rescale per 64-key tile instead of per key. Scores for the tile
 // are staged in shared memory. qkv layout: [rows, 2304], q|k|v thirds.
@@ -320,6 +328,56 @@ __global__ void attn_kernel(const __half *__restrict__ qkv, __half *__restrict__
         m2 = m2_new;
     }
 
+    const float inv = (l > 0.f) ? 1.0f / l : 0.0f;
+    __half *ob = out + ((long)g * seq + qrow) * kD + h * kHeadDim;
+#pragma unroll
+    for (int d = 0; d < kHeadDim; ++d) ob[d] = __float2half(acc[d] * inv);
+}
+
+// Original per-key online softmax kernel (no smem staging, high occupancy).
+// Kept as the default until a tiled/tensor-core kernel beats it measurably.
+__global__ void attn_kernel_simple(const __half *__restrict__ qkv, __half *__restrict__ out,
+                                   int seq, float scale_log2e) {
+    const int qrow = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h = blockIdx.y;
+    const int g = blockIdx.z;
+    if (qrow >= seq) return;
+    const long row_stride = kQKV;
+    const __half *qbase = qkv + ((long)g * seq + qrow) * row_stride + h * kHeadDim;
+    float q[kHeadDim];
+#pragma unroll
+    for (int d = 0; d < kHeadDim; ++d) q[d] = __half2float(qbase[d]);
+    const __half *kbase0 = qkv + (long)g * seq * row_stride + kD + h * kHeadDim;
+    const __half *vbase0 = qkv + (long)g * seq * row_stride + 2 * kD + h * kHeadDim;
+    float m2 = -1e30f;
+    float l = 0.f;
+    float acc[kHeadDim];
+#pragma unroll
+    for (int d = 0; d < kHeadDim; ++d) acc[d] = 0.f;
+    for (int k = 0; k <= qrow; ++k) {
+        const __half *kb = kbase0 + (long)k * row_stride;
+        float s = 0.f;
+#pragma unroll
+        for (int d = 0; d < kHeadDim; d += 2) {
+            __half2 kv = *reinterpret_cast<const __half2 *>(kb + d);
+            float2 f = __half22float2(kv);
+            s += q[d] * f.x + q[d + 1] * f.y;
+        }
+        s *= scale_log2e;
+        const float m_new = fmaxf(m2, s);
+        const float p = exp2f(s - m_new);
+        const float corr = exp2f(m2 - m_new);
+        l = l * corr + p;
+        const __half *vb = vbase0 + (long)k * row_stride;
+#pragma unroll
+        for (int d = 0; d < kHeadDim; d += 2) {
+            __half2 vv = *reinterpret_cast<const __half2 *>(vb + d);
+            float2 f = __half22float2(vv);
+            acc[d] = acc[d] * corr + p * f.x;
+            acc[d + 1] = acc[d + 1] * corr + p * f.y;
+        }
+        m2 = m_new;
+    }
     const float inv = (l > 0.f) ? 1.0f / l : 0.0f;
     __half *ob = out + ((long)g * seq + qrow) * kD + h * kHeadDim;
 #pragma unroll
@@ -535,13 +593,15 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int32_t *__restr
 static cublasHandle_t g_cublasHandle = nullptr;
 static cublasLtHandle_t g_ltHandle = nullptr;
 static int g_gemm_mode = 0; /* 1 = cuBLASLt per-shape plans, 0 = cublasGemmEx */
-static int g_attn_wmma = 0; /* 1 = tensor-core flash attention, 0 = tiled fp32 attention */
+static int g_attn_mode = 0; /* 0 = simple per-key, 1 = tiled smem, 2 = tensor-core WMMA */
+static int g_heur_idx = 0;  /* cuBLASLt heuristic candidate index (for sweeps) */
 static void *g_ltWs = nullptr;
 static size_t g_ltWsBytes = 0;
 
 struct LtPlan {
     long M = 0, K = 0, N = 0;
     int opA = -1;
+    int epi = 0; /* 0 = plain, 1 = bias epilogue */
     cublasLtMatmulDesc_t op_desc = nullptr;
     cublasLtMatrixLayout_t a_desc = nullptr, b_desc = nullptr, c_desc = nullptr;
     cublasLtMatmulAlgo_t algo{};
@@ -550,14 +610,16 @@ struct LtPlan {
 };
 static std::vector<LtPlan> g_plans;
 
-static LtPlan *lt_get_plan(long M, long K, long N, int opA) {
+static LtPlan *lt_get_plan(long M, long K, long N, int opA, int epi) {
     for (auto &p : g_plans)
-        if (p.valid && p.M == M && p.K == K && p.N == N && p.opA == opA) return &p;
+        if (p.valid && p.M == M && p.K == K && p.N == N && p.opA == opA && p.epi == epi)
+            return &p;
     LtPlan p;
     p.M = M;
     p.K = K;
     p.N = N;
     p.opA = opA;
+    p.epi = epi;
     cublasOperation_t ta = (opA == 1) ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t tb = CUBLAS_OP_N;
     bool ok = cublasLtMatmulDescCreate(&p.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) ==
@@ -568,6 +630,11 @@ static LtPlan *lt_get_plan(long M, long K, long N, int opA) {
     if (ok)
         ok &= cublasLtMatmulDescSetAttribute(p.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
                                              sizeof(tb)) == CUBLAS_STATUS_SUCCESS;
+    if (ok && epi == 1) {
+        cublasLtEpilogue_t e = CUBLASLT_EPILOGUE_BIAS;
+        ok &= cublasLtMatmulDescSetAttribute(p.op_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &e,
+                                             sizeof(e)) == CUBLAS_STATUS_SUCCESS;
+    }
     int a_rows = (opA == 1) ? (int)K : (int)N;
     int a_cols = (opA == 1) ? (int)N : (int)K;
     int lda = (opA == 1) ? (int)K : (int)N;
@@ -600,8 +667,9 @@ static LtPlan *lt_get_plan(long M, long K, long N, int opA) {
     if (pref) cublasLtMatmulPreferenceDestroy(pref);
     p.valid = ok;
     if (ok) {
-        p.algo = heur[0].algo;
-        p.ws_bytes = heur[0].workspaceSize;
+        const int hidx = (g_heur_idx < nres) ? g_heur_idx : nres - 1;
+        p.algo = heur[hidx].algo;
+        p.ws_bytes = heur[hidx].workspaceSize;
     }
     g_plans.push_back(p);
     return p.valid ? &g_plans.back() : nullptr;
@@ -610,10 +678,18 @@ static LtPlan *lt_get_plan(long M, long K, long N, int opA) {
 // Row-major C[M,N] = alpha * X[M,K] @ W[K,N] + beta * C, fp16 in/out, fp32 accum.
 // Implemented by viewing the row-major buffers as their column-major transposes:
 // C_cm[N,M] = W_cm[N,K] @ X_cm[K,M].
+static cublasStatus_t gemm_ex_raw(const __half *X, const __half *W, __half *C, long M, long K,
+                                  long N, float beta) {
+    float alpha = 1.0f;
+    return cublasGemmEx(g_cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, (int)N, (int)M, (int)K, &alpha,
+                        W, CUDA_R_16F, (int)N, X, CUDA_R_16F, (int)K, &beta, C, CUDA_R_16F,
+                        (int)N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
 static cublasStatus_t gemm_xw(const __half *X, const __half *W, __half *C, long M, long K, long N,
                               float beta) {
     if (g_gemm_mode == 1 && g_ltHandle) {
-        LtPlan *p = lt_get_plan(M, K, N, 0);
+        LtPlan *p = lt_get_plan(M, K, N, 0, 0);
         if (p) {
             float alpha = 1.0f;
             return cublasLtMatmul(g_ltHandle, p->op_desc, &alpha, W, p->a_desc, X, p->b_desc,
@@ -621,10 +697,28 @@ static cublasStatus_t gemm_xw(const __half *X, const __half *W, __half *C, long 
                                   p->ws_bytes, 0);
         }
     }
-    float alpha = 1.0f;
-    return cublasGemmEx(g_cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, (int)N, (int)M, (int)K, &alpha,
-                        W, CUDA_R_16F, (int)N, X, CUDA_R_16F, (int)K, &beta, C, CUDA_R_16F,
-                        (int)N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return gemm_ex_raw(X, W, C, M, K, N, beta);
+}
+
+// Same as gemm_xw but with the per-output-channel bias folded into the epilogue.
+static cublasStatus_t gemm_xw_bias(const __half *X, const __half *W, __half *C, long M, long K,
+                                   long N, float beta, const __half *bias) {
+    if (g_gemm_mode == 1 && g_ltHandle) {
+        LtPlan *p = lt_get_plan(M, K, N, 0, 1);
+        if (p) {
+            cublasLtMatmulDescSetAttribute(p->op_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias,
+                                           sizeof(bias));
+            float alpha = 1.0f;
+            return cublasLtMatmul(g_ltHandle, p->op_desc, &alpha, W, p->a_desc, X, p->b_desc,
+                                  &beta, C, p->c_desc, C, p->c_desc, &p->algo, g_ltWs,
+                                  p->ws_bytes, 0);
+        }
+    }
+    cublasStatus_t s = gemm_ex_raw(X, W, C, M, K, N, beta);
+    if (s != CUBLAS_STATUS_SUCCESS) return s;
+    long total2 = M * N / 2;
+    bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(C, bias, total2, (int)(N / 2));
+    return CUBLAS_STATUS_SUCCESS;
 }
 
 // Row-major C[M,N] = X[M,K] @ Wt[N,K]^T (tied-embedding logits), fp16 in/out.
@@ -851,18 +945,27 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     g_profile = penv && std::atoi(penv) == 1;
     if (g_profile && prof_init(2048) != 0) g_profile = false;
 
+    const char *henv = std::getenv("INFERIO_HEUR");
+    g_heur_idx = henv ? std::atoi(henv) : 0;
+    if (g_heur_idx < 0) g_heur_idx = 0;
+
     const char *aenv = std::getenv("INFERIO_ATTN");
-    g_attn_wmma = (aenv && std::strcmp(aenv, "wmma") == 0) ? 1 : 0;
-    if (g_attn_wmma) {
+    g_attn_mode = 0;
+    if (aenv) {
+        if (std::strcmp(aenv, "tiled") == 0) g_attn_mode = 1;
+        else if (std::strcmp(aenv, "wmma") == 0) g_attn_mode = 2;
+    }
+    if (g_attn_mode == 2) {
         cudaError_t e = cudaFuncSetAttribute((const void *)attn_wmma_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              kAttnSmemBytes);
         if (e != cudaSuccess) {
-            g_attn_wmma = 0;
+            g_attn_mode = 0;
             cudaGetLastError();
         }
     }
-    std::printf("INFERIO_INIT attn=%s\n", g_attn_wmma ? "wmma" : "tiled");
+    const char *attn_names[3] = {"simple", "tiled", "wmma"};
+    std::printf("INFERIO_INIT attn=%s\n", attn_names[g_attn_mode]);
     std::fflush(stdout);
 
     int rc = load_model(model_dir);
@@ -937,35 +1040,28 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             if (g0 == 0 && l == 0) dump_tensor("02_ln1_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_QKV);
-            CUBLAS_CK(gemm_xw(g_m.xn, qkvw->dev, g_m.qkv, tr, kD, kQKV, 0.0f));
-            {
-                long total2 = tr * kQKV / 2;
-                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.qkv, qkvb->dev, total2,
-                                                                     kQKV / 2);
-            }
+            CUBLAS_CK(gemm_xw_bias(g_m.xn, qkvw->dev, g_m.qkv, tr, kD, kQKV, 0.0f, qkvb->dev));
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
-            if (g_attn_wmma) {
+            if (g_attn_mode == 2) {
                 dim3 wgrid((seqlen + kAttnBr - 1) / kAttnBr, kHeads, gn);
                 attn_wmma_kernel<<<wgrid, 128, kAttnSmemBytes>>>(g_m.qkv, g_m.att, seqlen,
                                                                  attn_scale_log2e);
-            } else {
+            } else if (g_attn_mode == 1) {
                 dim3 agrid((seqlen + 127) / 128, kHeads, gn);
                 attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
                                                                  attn_scale_log2e);
+            } else {
+                dim3 agrid((seqlen + 127) / 128, kHeads, gn);
+                attn_kernel_simple<<<agrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_PROJ);
-            CUBLAS_CK(gemm_xw(g_m.att, pw->dev, g_m.x, tr, kD, kD, 1.0f));
-            {
-                long total2 = tr * kD / 2;
-                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.x, pb->dev, total2,
-                                                                     kD / 2);
-            }
+            CUBLAS_CK(gemm_xw_bias(g_m.att, pw->dev, g_m.x, tr, kD, kD, 1.0f, pb->dev));
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("05_proj_x", g_m.x, (size_t)tr * kD * 2);
 
@@ -975,22 +1071,16 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             if (g0 == 0 && l == 0) dump_tensor("06_ln2_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC1);
-            CUBLAS_CK(gemm_xw(g_m.xn, f1w->dev, g_m.ffn, tr, kD, kFF, 0.0f));
+            CUBLAS_CK(gemm_xw_bias(g_m.xn, f1w->dev, g_m.ffn, tr, kD, kFF, 0.0f, f1b->dev));
             {
                 long total2 = tr * kFF / 2;
-                bias_gelu_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.ffn, f1b->dev, total2,
-                                                                      kFF / 2);
+                gelu_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.ffn, total2);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("07_fc1_gelu", g_m.ffn, (size_t)tr * kFF * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC2);
-            CUBLAS_CK(gemm_xw(g_m.ffn, f2w->dev, g_m.x, tr, kFF, kD, 1.0f));
-            {
-                long total2 = tr * kD / 2;
-                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.x, f2b->dev, total2,
-                                                                     kD / 2);
-            }
+            CUBLAS_CK(gemm_xw_bias(g_m.ffn, f2w->dev, g_m.x, tr, kFF, kD, 1.0f, f2b->dev));
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("08_fc2_x", g_m.x, (size_t)tr * kD * 2);
         }
