@@ -152,3 +152,41 @@ entry verbatim from the result JSONs of record in `temp/results/`.
 - **Result (median ms):** B=1024: v08 15697.5/15173.2 vs v09 14245.6/14318.8 (**-6%**, consistent). B=256: 3399/3855 vs 3567/3603 (wash). B=64: 788/908 vs 906/893 (wash).
 - **Verdict:** v0.9.0 accepted: never worse outside noise, -6% at B=1024 (target), parity PASS (max logit diff 0.115, improved from 0.247). The official-run small-batch regression (+12..19%) is NOT reproducible in A/B — session noise, recorded as such.
 - Phase effect at B=1024: qkv -26%, fc2 -16%, ln -17%, attn -2%, fc1 +6%, proj +20% (proj regression not investigated yet).
+## Run `20261125-180521Z-gpu0` — engine v0.12.2 (git 8172228) — GPU 0
+- spec v1, harness sha256 04eb754a522eea33…
+- **Change vs previous run:** v0.12.2: attention score scale folded into Q at load (attn phase -2..3%); default config otherwise identical to v0.9.0 (group 64, mma attention)
+- device env: 0, Tesla T4, 580.178.04, 15360 MiB, 1035 MHz, 62; 1, Tesla T4, 580.178.04, 15360 MiB, 300 MHz, 34
+
+| B | status | median ms | min ms | max ms | tokens/s | peak GiB | group |
+|---|--------|-----------|--------|--------|----------|----------|-------|
+| 1 | ok | 13.82 | 13.69 | 13.85 | 74118.0 | 0.34 | 1 |
+| 4 | ok | 49.77 | 48.91 | 52.26 | 82295.7 | 0.39 | 4 |
+| 16 | ok | 196.20 | 195.50 | 197.37 | 83504.5 | 0.56 | 16 |
+| 32 | ok | 405.84 | 404.24 | 407.27 | 80740.3 | 0.80 | 32 |
+| 64 | ok | 841.32 | 832.39 | 857.90 | 77896.4 | 1.28 | 64 |
+| 128 | ok | 1743.51 | 1718.77 | 1749.30 | 75177.1 | 1.30 | 64 |
+| 256 | ok | 3765.97 | 3642.42 | 3879.76 | 69608.6 | 1.34 | 64 |
+| 512 | ok | 7060.36 | 6999.94 | 7269.37 | 74258.0 | 1.41 | 64 |
+| 1024 | ok | 14321.53 | 14248.13 | 14534.72 | 73216.8 | 1.56 | 64 |
+
+- only the rows above were measured; nothing inferred. full data: `20261125-180521Z-gpu0.json`
+
+## Exploratory note `2026-11-25 v0.10 K staging` — engine v0.10.0 — GPU 0
+- **What was tried:** stage the 64-key K tile in shared memory (buffer reused with V between phases, occupancy-neutral) to remove 4x redundant global K reads.
+- **Result:** null. Attention phase +2..3% (two extra __syncthreads per tile eat the smem savings); everything else a wash. Reverted (commit 54a0f95).
+- **Verdict:** K global reads are L2-cached and cheap; instruction overhead is not the attention bottleneck.
+
+## Exploratory note `2026-11-25 v0.11 launch_bounds` — engine v0.11.0 — GPU 0
+- **What was tried:** __launch_bounds__(128,5) on attn_mma_kernel to fit 5 blocks/SM (from 4) and feed the SFU better.
+- **Result:** clearly worse — B=1024 +5..9%, attention +5..10% (register cap to 102 causes spills). Reverted (commit 0ea814b).
+- **Verdict:** the register/occupancy lever needs a kernel restructure (fewer live registers), not a cap.
+
+## Exploratory note `2026-11-25 mma128 variant` — engine v0.12.0/1 — GPU 0 + 1
+- **What was tried:** attn_mma128 (INFERIO_ATTN=mma128 option): 128-key tiles, halving V loads and syncs per key; smem 18 KB -> 3 blocks/SM. First version had a stack overflow (c/pa sized 8 indexed to 16 -> NaN, parity FAIL); fixed in v0.12.1.
+- **Result (fixed, parity PASS, max diff 0.166):** attention 25..28% SLOWER (occupancy 4->3 blocks/SM hurts more than the saved loads — the v0.3 lesson repeats); total time a wash. Kept as an option, not default.
+- **Verdict:** 64-key tiles are the right size for this kernel shape on SM75.
+
+## Exploratory note `2026-11-25 group tweak + scale fold` — GPU 0
+- **Group tweak (128 for B<=256, 64 above):** A/B at B=256 showed group 128 is 5..6% SLOWER than 64 (v12 3774/3788 vs v09 3606/3572) — group 64 wins at 256 too; the official v0.9-run mid-batch regression was session noise. Tweak reverted; group 64 everywhere.
+- **Scale fold (v0.12.2):** Q pre-scaled by 1/sqrt(64)*log2(e) at load, removing 32 multiplies per thread per tile. A/B at B=1024: attention phase -2..3% consistently, total a wash. Accepted (parity PASS, max diff 0.237 vs 0.115 — extra fp16 rounding, argmax identical).
+- **Official v0.12.2 run:** within noise of v0.9.0 at every batch (B=1024: 14321.5 vs 14291.4 ms). Caveat: this run was at 1035 MHz SM clock vs 900-915 MHz for v0.9.0's official run, so cross-session deltas are clock-inflated; the same-session A/B (wash overall, attention -2..3%) is the valid comparison. Champions: v0.9.0/v0.12.2 config.
