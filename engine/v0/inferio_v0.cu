@@ -601,7 +601,7 @@ __global__ void attn_mma128_kernel(const __half *__restrict__ qkv, __half *__res
             attn_vs[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + 2 * kD + dd];
         }
         __syncthreads();
-        float c[8][4];
+        float c[16][4];
 #pragma unroll
         for (int kg = 0; kg < 16; ++kg) {
 #pragma unroll
@@ -647,7 +647,7 @@ __global__ void attn_mma128_kernel(const __half *__restrict__ qkv, __half *__res
             o[n][3] *= corr_r8;
         }
 
-        unsigned pa[8][2];
+        unsigned pa[16][2];
         float sum_r = 0.f, sum_r8 = 0.f;
 #pragma unroll
         for (int kg = 0; kg < 16; ++kg) {
