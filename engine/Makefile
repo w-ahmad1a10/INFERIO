@@ -7,7 +7,7 @@ all: $(OUT)
 
 $(OUT): $(SRC) inferio.h
 	mkdir -p build
-	$(NVCC) -O3 -std=c++17 -Xcompiler -fPIC -arch=$(ARCH) -lineinfo -I. -shared $(SRC) -lcublas -o $(OUT)
+	$(NVCC) -O3 -std=c++17 -Xcompiler -fPIC -arch=$(ARCH) -lineinfo -I. -shared $(SRC) -lcublas -lcublasLt -o $(OUT)
 
 clean:
 	rm -rf build

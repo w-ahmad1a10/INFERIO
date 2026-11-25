@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -173,32 +174,42 @@ __global__ void ln_kernel(const __half *__restrict__ x, const __half *__restrict
                           const __half *__restrict__ b, __half *__restrict__ y, int D,
                           float eps) {
     const long row = blockIdx.x;
-    const __half *xr = x + row * D;
-    __half *yr = y + row * D;
+    const __half2 *x2 = reinterpret_cast<const __half2 *>(x + row * D);
+    __half2 *y2 = reinterpret_cast<__half2 *>(y + row * D);
+    const __half2 *w2 = reinterpret_cast<const __half2 *>(w);
+    const __half2 *b2 = reinterpret_cast<const __half2 *>(b);
+    const int D2 = D / 2;
     __shared__ float s1[BLOCK / 32];
     __shared__ float s2[BLOCK / 32];
     __shared__ float mean_sh, inv_sh;
 
     float sum = 0.f;
-    for (int i = threadIdx.x; i < D; i += BLOCK) sum += __half2float(xr[i]);
+    for (int i = threadIdx.x; i < D2; i += BLOCK) {
+        float2 f = __half22float2(x2[i]);
+        sum += f.x + f.y;
+    }
     sum = block_reduce_sum<BLOCK>(sum, s1);
     if (threadIdx.x == 0) mean_sh = sum / (float)D;
     __syncthreads();
     const float mean = mean_sh;
 
     float var = 0.f;
-    for (int i = threadIdx.x; i < D; i += BLOCK) {
-        float t = __half2float(xr[i]) - mean;
-        var += t * t;
+    for (int i = threadIdx.x; i < D2; i += BLOCK) {
+        float2 f = __half22float2(x2[i]);
+        const float tx = f.x - mean, ty = f.y - mean;
+        var += tx * tx + ty * ty;
     }
     var = block_reduce_sum<BLOCK>(var, s2);
     if (threadIdx.x == 0) inv_sh = rsqrtf(var / (float)D + eps);
     __syncthreads();
     const float inv = inv_sh;
 
-    for (int i = threadIdx.x; i < D; i += BLOCK) {
-        yr[i] = __float2half((__half2float(xr[i]) - mean) * inv * __half2float(w[i]) +
-                             __half2float(b[i]));
+    for (int i = threadIdx.x; i < D2; i += BLOCK) {
+        float2 f = __half22float2(x2[i]);
+        float2 wf = __half22float2(w2[i]);
+        float2 bf = __half22float2(b2[i]);
+        y2[i] = __floats2half2_rn((f.x - mean) * inv * wf.x + bf.x,
+                                  (f.y - mean) * inv * wf.y + bf.y);
     }
 }
 
@@ -321,12 +332,93 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int32_t *__restr
 
 // -------------------------------------------------------------- gemm helpers --
 static cublasHandle_t g_cublasHandle = nullptr;
+static cublasLtHandle_t g_ltHandle = nullptr;
+static int g_gemm_mode = 0; /* 1 = cuBLASLt per-shape plans, 0 = cublasGemmEx */
+static void *g_ltWs = nullptr;
+static size_t g_ltWsBytes = 0;
+
+struct LtPlan {
+    long M = 0, K = 0, N = 0;
+    int opA = -1;
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr, b_desc = nullptr, c_desc = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    size_t ws_bytes = 0;
+    bool valid = false;
+};
+static std::vector<LtPlan> g_plans;
+
+static LtPlan *lt_get_plan(long M, long K, long N, int opA) {
+    for (auto &p : g_plans)
+        if (p.valid && p.M == M && p.K == K && p.N == N && p.opA == opA) return &p;
+    LtPlan p;
+    p.M = M;
+    p.K = K;
+    p.N = N;
+    p.opA = opA;
+    cublasOperation_t ta = (opA == 1) ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t tb = CUBLAS_OP_N;
+    bool ok = cublasLtMatmulDescCreate(&p.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) ==
+              CUBLAS_STATUS_SUCCESS;
+    if (ok)
+        ok &= cublasLtMatmulDescSetAttribute(p.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
+                                             sizeof(ta)) == CUBLAS_STATUS_SUCCESS;
+    if (ok)
+        ok &= cublasLtMatmulDescSetAttribute(p.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
+                                             sizeof(tb)) == CUBLAS_STATUS_SUCCESS;
+    int a_rows = (opA == 1) ? (int)K : (int)N;
+    int a_cols = (opA == 1) ? (int)N : (int)K;
+    int lda = (opA == 1) ? (int)K : (int)N;
+    if (ok)
+        ok &= cublasLtMatrixLayoutCreate(&p.a_desc, CUDA_R_16F, a_rows, a_cols, lda) ==
+              CUBLAS_STATUS_SUCCESS;
+    if (ok)
+        ok &= cublasLtMatrixLayoutCreate(&p.b_desc, CUDA_R_16F, (int)K, (int)M, (int)K) ==
+              CUBLAS_STATUS_SUCCESS;
+    if (ok)
+        ok &= cublasLtMatrixLayoutCreate(&p.c_desc, CUDA_R_16F, (int)N, (int)M, (int)N) ==
+              CUBLAS_STATUS_SUCCESS;
+    cublasLtMatmulPreference_t pref = nullptr;
+    int nres = 0;
+    cublasLtMatmulHeuristicResult_t heur[8];
+    if (ok) {
+        ok &= cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS;
+        if (ok) {
+            size_t max_ws = g_ltWsBytes;
+            ok &= cublasLtMatmulPreferenceSetAttribute(
+                      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws,
+                      sizeof(max_ws)) == CUBLAS_STATUS_SUCCESS;
+        }
+        if (ok)
+            ok &= cublasLtMatmulAlgoGetHeuristic(g_ltHandle, p.op_desc, p.a_desc, p.b_desc,
+                                                 p.c_desc, p.c_desc, pref, 8, heur, &nres) ==
+                      CUBLAS_STATUS_SUCCESS &&
+                  nres > 0;
+    }
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    p.valid = ok;
+    if (ok) {
+        p.algo = heur[0].algo;
+        p.ws_bytes = heur[0].workspaceSize;
+    }
+    g_plans.push_back(p);
+    return p.valid ? &g_plans.back() : nullptr;
+}
 
 // Row-major C[M,N] = alpha * X[M,K] @ W[K,N] + beta * C, fp16 in/out, fp32 accum.
 // Implemented by viewing the row-major buffers as their column-major transposes:
 // C_cm[N,M] = W_cm[N,K] @ X_cm[K,M].
 static cublasStatus_t gemm_xw(const __half *X, const __half *W, __half *C, long M, long K, long N,
                               float beta) {
+    if (g_gemm_mode == 1 && g_ltHandle) {
+        LtPlan *p = lt_get_plan(M, K, N, 0);
+        if (p) {
+            float alpha = 1.0f;
+            return cublasLtMatmul(g_ltHandle, p->op_desc, &alpha, W, p->a_desc, X, p->b_desc,
+                                  &beta, C, p->c_desc, C, p->c_desc, &p->algo, g_ltWs,
+                                  p->ws_bytes, 0);
+        }
+    }
     float alpha = 1.0f;
     return cublasGemmEx(g_cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N, (int)N, (int)M, (int)K, &alpha,
                         W, CUDA_R_16F, (int)N, X, CUDA_R_16F, (int)K, &beta, C, CUDA_R_16F,
@@ -336,7 +428,17 @@ static cublasStatus_t gemm_xw(const __half *X, const __half *W, __half *C, long 
 // Row-major C[M,N] = X[M,K] @ Wt[N,K]^T (tied-embedding logits), fp16 in/out.
 static cublasStatus_t gemm_xwt(const __half *X, const __half *Wt, __half *C, long M, long K,
                                long N) {
-    float alpha = 1.0f, beta = 0.0f;
+    float beta = 0.0f;
+    if (g_gemm_mode == 1 && g_ltHandle) {
+        LtPlan *p = lt_get_plan(M, K, N, 1);
+        if (p) {
+            float alpha = 1.0f;
+            return cublasLtMatmul(g_ltHandle, p->op_desc, &alpha, Wt, p->a_desc, X, p->b_desc,
+                                  &beta, C, p->c_desc, C, p->c_desc, &p->algo, g_ltWs,
+                                  p->ws_bytes, 0);
+        }
+    }
+    float alpha = 1.0f;
     return cublasGemmEx(g_cublasHandle, CUBLAS_OP_T, CUBLAS_OP_N, (int)N, (int)M, (int)K, &alpha,
                         Wt, CUDA_R_16F, (int)K, X, CUDA_R_16F, (int)K, &beta, C, CUDA_R_16F,
                         (int)N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
@@ -519,6 +621,19 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     CUDA_CK(cudaSetDevice(gpu_index));
     CUDA_CK(cudaFree(nullptr));
     CUBLAS_CK(cublasCreate(&g_cublasHandle));
+
+    const char *genv = std::getenv("INFERIO_GEMM");
+    g_gemm_mode = (genv && std::strcmp(genv, "ex") == 0) ? 0 : 1;
+    if (g_gemm_mode == 1) {
+        if (cublasLtCreate(&g_ltHandle) != CUBLAS_STATUS_SUCCESS) {
+            g_ltHandle = nullptr;
+            g_gemm_mode = 0;
+        } else {
+            g_ltWsBytes = 96ull << 20;
+            g_ltWs = dev_alloc(g_ltWsBytes);
+            if (!g_ltWs) g_gemm_mode = 0;
+        }
+    }
 
     cudaDeviceProp prop{};
     CUDA_CK(cudaGetDeviceProperties(&prop, gpu_index));
@@ -728,6 +843,20 @@ extern "C" const char *inferio_last_error(void) { return g_err.c_str(); }
 extern "C" const char *inferio_version(void) { return INFERIO_VERSION; }
 
 extern "C" void inferio_shutdown(void) {
+    for (auto &p : g_plans) {
+        if (p.op_desc) cublasLtMatmulDescDestroy(p.op_desc);
+        if (p.a_desc) cublasLtMatrixLayoutDestroy(p.a_desc);
+        if (p.b_desc) cublasLtMatrixLayoutDestroy(p.b_desc);
+        if (p.c_desc) cublasLtMatrixLayoutDestroy(p.c_desc);
+    }
+    g_plans.clear();
+    dev_free(g_ltWs, g_ltWsBytes);
+    g_ltWs = nullptr;
+    g_ltWsBytes = 0;
+    if (g_ltHandle) {
+        cublasLtDestroy(g_ltHandle);
+        g_ltHandle = nullptr;
+    }
     if (g_cublasHandle) {
         cublasDestroy(g_cublasHandle);
         g_cublasHandle = nullptr;
