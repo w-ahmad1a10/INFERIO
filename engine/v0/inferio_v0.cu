@@ -425,12 +425,16 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
 
     unsigned qa[8][2];
     {
+        // Q pre-scaled by scale_log2e at load (folds the per-tile score scaling
+        // into the mma inputs: (s*q)*k == s*(q*k) up to fp16 rounding).
         const __half *p0 = qkv_g + (long)r * row_stride;
         const __half *p8 = qkv_g + (long)r8 * row_stride;
 #pragma unroll
         for (int dch = 0; dch < 8; ++dch) {
-            qa[dch][0] = *reinterpret_cast<const unsigned *>(p0 + dch * 8 + t * 2);
-            qa[dch][1] = *reinterpret_cast<const unsigned *>(p8 + dch * 8 + t * 2);
+            float2 q0 = __half22float2(*reinterpret_cast<const __half2 *>(p0 + dch * 8 + t * 2));
+            float2 q8 = __half22float2(*reinterpret_cast<const __half2 *>(p8 + dch * 8 + t * 2));
+            qa[dch][0] = pack_half2(q0.x * scale_log2e, q0.y * scale_log2e);
+            qa[dch][1] = pack_half2(q8.x * scale_log2e, q8.y * scale_log2e);
         }
     }
 
@@ -474,10 +478,6 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
 #pragma unroll
         for (int kg = 0; kg < 8; ++kg) {
             const int col = k0 + kg * 8 + t * 2;
-            c[kg][0] *= scale_log2e;
-            c[kg][1] *= scale_log2e;
-            c[kg][2] *= scale_log2e;
-            c[kg][3] *= scale_log2e;
             if (col > r) c[kg][0] = -1e30f;
             if (col + 1 > r) c[kg][1] = -1e30f;
             if (col > r8) c[kg][2] = -1e30f;
@@ -570,12 +570,16 @@ __global__ void attn_mma128_kernel(const __half *__restrict__ qkv, __half *__res
 
     unsigned qa[8][2];
     {
+        // Q pre-scaled by scale_log2e at load (folds the per-tile score scaling
+        // into the mma inputs: (s*q)*k == s*(q*k) up to fp16 rounding).
         const __half *p0 = qkv_g + (long)r * row_stride;
         const __half *p8 = qkv_g + (long)r8 * row_stride;
 #pragma unroll
         for (int dch = 0; dch < 8; ++dch) {
-            qa[dch][0] = *reinterpret_cast<const unsigned *>(p0 + dch * 8 + t * 2);
-            qa[dch][1] = *reinterpret_cast<const unsigned *>(p8 + dch * 8 + t * 2);
+            float2 q0 = __half22float2(*reinterpret_cast<const __half2 *>(p0 + dch * 8 + t * 2));
+            float2 q8 = __half22float2(*reinterpret_cast<const __half2 *>(p8 + dch * 8 + t * 2));
+            qa[dch][0] = pack_half2(q0.x * scale_log2e, q0.y * scale_log2e);
+            qa[dch][1] = pack_half2(q8.x * scale_log2e, q8.y * scale_log2e);
         }
     }
 
@@ -618,10 +622,6 @@ __global__ void attn_mma128_kernel(const __half *__restrict__ qkv, __half *__res
 #pragma unroll
         for (int kg = 0; kg < 16; ++kg) {
             const int col = k0 + kg * 8 + t * 2;
-            c[kg][0] *= scale_log2e;
-            c[kg][1] *= scale_log2e;
-            c[kg][2] *= scale_log2e;
-            c[kg][3] *= scale_log2e;
             if (col > r) c[kg][0] = -1e30f;
             if (col + 1 > r) c[kg][1] = -1e30f;
             if (col > r8) c[kg][2] = -1e30f;
@@ -973,8 +973,7 @@ static int load_model(const char *dir) {
 static int ensure_buffers(int batch, int seqlen) {
     const char *genv = std::getenv("INFERIO_GROUP");
     int group_cap = genv ? std::atoi(genv) : 0;
-    if (group_cap <= 0) group_cap = (batch <= 256) ? std::max(1, 131072 / seqlen)
-                                                   : std::max(1, 65536 / seqlen);
+    if (group_cap <= 0) group_cap = std::max(1, 65536 / seqlen);
     int group = std::min(batch, group_cap);
     long long rows = (long long)group * seqlen;
 
