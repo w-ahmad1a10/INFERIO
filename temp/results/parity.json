@@ -1,0 +1,16 @@
+{
+  "batch": 2,
+  "ids_match_frozen_rule": true,
+  "argmax_equal": true,
+  "argmax_engine": [
+    338,
+    338
+  ],
+  "argmax_oracle": [
+    338,
+    338
+  ],
+  "max_abs_logit_diff": 0.22861480712890625,
+  "mean_abs_logit_diff": 0.08872523903846741,
+  "prefill_ms": 149.0370635986328
+}
