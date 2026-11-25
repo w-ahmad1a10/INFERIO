@@ -170,6 +170,9 @@ __device__ __forceinline__ float block_reduce_sum(float val, float *shared) {
     return val;
 }
 
+// Two-pass LayerNorm: pass 1 computes sum and sum-of-squares together
+// (var = E[x^2] - mean^2, clamped >= 0), pass 2 normalizes. One third less
+// read traffic than the three-pass version.
 template <int BLOCK>
 __global__ void ln_kernel(const __half *__restrict__ x, const __half *__restrict__ w,
                           const __half *__restrict__ b, __half *__restrict__ y, int D,
@@ -184,25 +187,23 @@ __global__ void ln_kernel(const __half *__restrict__ x, const __half *__restrict
     __shared__ float s2[BLOCK / 32];
     __shared__ float mean_sh, inv_sh;
 
-    float sum = 0.f;
+    float sum = 0.f, sumsq = 0.f;
     for (int i = threadIdx.x; i < D2; i += BLOCK) {
         float2 f = __half22float2(x2[i]);
         sum += f.x + f.y;
+        sumsq += f.x * f.x + f.y * f.y;
     }
     sum = block_reduce_sum<BLOCK>(sum, s1);
-    if (threadIdx.x == 0) mean_sh = sum / (float)D;
+    sumsq = block_reduce_sum<BLOCK>(sumsq, s2);
+    if (threadIdx.x == 0) {
+        const float mean = sum / (float)D;
+        float var = sumsq / (float)D - mean * mean;
+        if (var < 0.f) var = 0.f;
+        mean_sh = mean;
+        inv_sh = rsqrtf(var + eps);
+    }
     __syncthreads();
     const float mean = mean_sh;
-
-    float var = 0.f;
-    for (int i = threadIdx.x; i < D2; i += BLOCK) {
-        float2 f = __half22float2(x2[i]);
-        const float tx = f.x - mean, ty = f.y - mean;
-        var += tx * tx + ty * ty;
-    }
-    var = block_reduce_sum<BLOCK>(var, s2);
-    if (threadIdx.x == 0) inv_sh = rsqrtf(var / (float)D + eps);
-    __syncthreads();
     const float inv = inv_sh;
 
     for (int i = threadIdx.x; i < D2; i += BLOCK) {
@@ -828,7 +829,7 @@ static int load_model(const char *dir) {
 static int ensure_buffers(int batch, int seqlen) {
     const char *genv = std::getenv("INFERIO_GROUP");
     int group_cap = genv ? std::atoi(genv) : 0;
-    if (group_cap <= 0) group_cap = std::max(1, 131072 / seqlen);
+    if (group_cap <= 0) group_cap = std::max(1, 65536 / seqlen);
     int group = std::min(batch, group_cap);
     long long rows = (long long)group * seqlen;
 
