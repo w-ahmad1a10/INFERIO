@@ -320,6 +320,8 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int32_t *__restr
 }
 
 // -------------------------------------------------------------- gemm helpers --
+static cublasHandle_t g_cublasHandle = nullptr;
+
 // Row-major C[M,N] = alpha * X[M,K] @ W[K,N] + beta * C, fp16 in/out, fp32 accum.
 // Implemented by viewing the row-major buffers as their column-major transposes:
 // C_cm[N,M] = W_cm[N,K] @ X_cm[K,M].
@@ -383,7 +385,6 @@ struct EngineState {
 };
 
 static EngineState g_m;
-static cublasHandle_t g_cublasHandle = nullptr;
 static cudaEvent_t g_ev0 = nullptr, g_ev1 = nullptr;
 
 static WTensor *get_t(const char *name) {
