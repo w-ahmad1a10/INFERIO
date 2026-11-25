@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <cmath>
@@ -325,6 +326,168 @@ __global__ void attn_kernel(const __half *__restrict__ qkv, __half *__restrict__
     for (int d = 0; d < kHeadDim; ++d) ob[d] = __float2half(acc[d] * inv);
 }
 
+// Tensor-core flash attention (two-pass: QK for row max, then QK again + PV).
+// Br = 64 queries per CTA (4 warps x 16 rows), Bc = 64 keys per tile, head_dim 64.
+// Scores/p rows are staged in shared memory because WMMA fragments are opaque.
+#define kAttnBr 64
+#define kAttnBc 64
+#define kAttnStride 72
+#define kAttnSmemBytes (4 * 64 * kAttnStride * 2 + 64 * kAttnStride * 4 + 2 * 64 * 4)
+
+__global__ void attn_wmma_kernel(const __half *__restrict__ qkv, __half *__restrict__ out,
+                                 int seq, float scale_log2e) {
+    extern __shared__ char smem_raw[];
+    __half *Qs = reinterpret_cast<__half *>(smem_raw);
+    __half *Ks = Qs + 64 * kAttnStride;
+    __half *Vs = Ks + 64 * kAttnStride;
+    __half *Ps = Vs + 64 * kAttnStride;
+    float *S = reinterpret_cast<float *>(Ps + 64 * kAttnStride);
+    float *rowmax = S + 64 * kAttnStride;
+    float *rowsum = rowmax + 64;
+
+    const int qc = blockIdx.x;
+    const int h = blockIdx.y;
+    const int g = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = warp * 16;
+    const int qbase_row = qc * kAttnBr + row0;
+    const long row_stride = kQKV;
+    const __half *qkv_g = qkv + (long)g * seq * row_stride + h * kHeadDim;
+
+    for (int i = threadIdx.x; i < kAttnBr * kHeadDim; i += blockDim.x) {
+        const int r = i / kHeadDim, d = i % kHeadDim;
+        Qs[r * kAttnStride + d] = qkv_g[(long)(qc * kAttnBr + r) * row_stride + d];
+    }
+    if (threadIdx.x < kAttnBr) {
+        rowmax[threadIdx.x] = -1e30f;
+        rowsum[threadIdx.x] = 0.f;
+    }
+    __syncthreads();
+
+    const int qmax = min(qc * kAttnBr + kAttnBr - 1, seq - 1);
+    const int n_tiles = (qmax + kAttnBc) / kAttnBc;
+
+    using wmma::accumulator;
+    using wmma::col_major;
+    using wmma::fragment;
+    using wmma::matrix_a;
+    using wmma::matrix_b;
+    using wmma::mem_row_major;
+    using wmma::row_major;
+
+    // Pass A: row max of scaled scores.
+    for (int t = 0; t < n_tiles; ++t) {
+        const int k0 = t * kAttnBc;
+        for (int i = threadIdx.x; i < kAttnBc * kHeadDim; i += blockDim.x) {
+            const int kk = i / kHeadDim, d = i % kHeadDim;
+            Ks[kk * kAttnStride + d] = qkv_g[(long)(k0 + kk) * row_stride + kD + d];
+        }
+        __syncthreads();
+
+        fragment<accumulator, 16, 16, 16, float> c[4];
+        for (int nk = 0; nk < 4; ++nk) {
+            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
+            fragment<matrix_b, 16, 16, 16, __half, col_major> b;
+            wmma::fill_fragment(c[nk], 0.f);
+            for (int dch = 0; dch < 4; ++dch) {
+                wmma::load_matrix_sync(a, &Qs[row0 * kAttnStride + dch * 16], kAttnStride);
+                wmma::load_matrix_sync(b, &Ks[(nk * 16) * kAttnStride + dch * 16], kAttnStride);
+                wmma::mma_sync(c[nk], a, b, c[nk]);
+            }
+            wmma::store_matrix_sync(&S[row0 * kAttnStride + nk * 16], c[nk], kAttnStride,
+                                    mem_row_major);
+        }
+        __syncthreads();
+
+        if (lane < 16) {
+            const int row = row0 + lane;
+            const int qrow = qc * kAttnBr + row;
+            float m = rowmax[row];
+            for (int kk = 0; kk < kAttnBc; ++kk) {
+                if (k0 + kk > qrow) break;
+                const float s = S[row * kAttnStride + kk] * scale_log2e;
+                S[row * kAttnStride + kk] = s;
+                m = fmaxf(m, s);
+            }
+            rowmax[row] = m;
+        }
+        __syncthreads();
+    }
+
+    fragment<accumulator, 16, 16, 16, float> o[4];
+    for (int i = 0; i < 4; ++i) wmma::fill_fragment(o[i], 0.f);
+
+    // Pass B: p = exp2(s - m2), accumulate l and O = P @ V.
+    for (int t = 0; t < n_tiles; ++t) {
+        const int k0 = t * kAttnBc;
+        for (int i = threadIdx.x; i < kAttnBc * kHeadDim; i += blockDim.x) {
+            const int kk = i / kHeadDim, d = i % kHeadDim;
+            const long krow = (long)(k0 + kk) * row_stride;
+            Ks[kk * kAttnStride + d] = qkv_g[krow + kD + d];
+            Vs[kk * kAttnStride + d] = qkv_g[krow + 2 * kD + d];
+        }
+        __syncthreads();
+
+        fragment<accumulator, 16, 16, 16, float> c[4];
+        for (int nk = 0; nk < 4; ++nk) {
+            fragment<matrix_a, 16, 16, 16, __half, row_major> a;
+            fragment<matrix_b, 16, 16, 16, __half, col_major> b;
+            wmma::fill_fragment(c[nk], 0.f);
+            for (int dch = 0; dch < 4; ++dch) {
+                wmma::load_matrix_sync(a, &Qs[row0 * kAttnStride + dch * 16], kAttnStride);
+                wmma::load_matrix_sync(b, &Ks[(nk * 16) * kAttnStride + dch * 16], kAttnStride);
+                wmma::mma_sync(c[nk], a, b, c[nk]);
+            }
+            wmma::store_matrix_sync(&S[row0 * kAttnStride + nk * 16], c[nk], kAttnStride,
+                                    mem_row_major);
+        }
+        __syncthreads();
+
+        if (lane < 16) {
+            const int row = row0 + lane;
+            const int qrow = qc * kAttnBr + row;
+            const float m2 = rowmax[row];
+            float l = 0.f;
+            for (int kk = 0; kk < kAttnBc; ++kk) {
+                float p = 0.f;
+                if (k0 + kk <= qrow) {
+                    p = exp2f(S[row * kAttnStride + kk] * scale_log2e - m2);
+                    l += p;
+                }
+                Ps[row * kAttnStride + kk] = __float2half(p);
+            }
+            rowsum[row] += l;
+        }
+        __syncthreads();
+
+        for (int kc = 0; kc < 4; ++kc) {
+            fragment<matrix_a, 16, 16, 16, __half, row_major> pa;
+            wmma::load_matrix_sync(pa, &Ps[row0 * kAttnStride + kc * 16], kAttnStride);
+            for (int n = 0; n < 4; ++n) {
+                fragment<matrix_b, 16, 16, 16, __half, row_major> vb;
+                wmma::load_matrix_sync(vb, &Vs[(kc * 16) * kAttnStride + n * 16], kAttnStride);
+                wmma::mma_sync(o[n], pa, vb, o[n]);
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int n = 0; n < 4; ++n)
+        wmma::store_matrix_sync(&S[row0 * kAttnStride + n * 16], o[n], kAttnStride,
+                                mem_row_major);
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < kAttnBr * kHeadDim; i += blockDim.x) {
+        const int r = i / kHeadDim, d = i % kHeadDim;
+        const int qrow = qc * kAttnBr + r;
+        if (qrow >= seq) continue;
+        const float inv = rowsum[r] > 0.f ? 1.f / rowsum[r] : 0.f;
+        out[(long)(g * seq + qrow) * kD + h * kHeadDim + d] =
+            __float2half(S[r * kAttnStride + d] * inv);
+    }
+}
+
 __global__ void gather_last_kernel(const __half *__restrict__ xn, __half *__restrict__ hlast,
                                    int g0, int seq, int D) {
     const int si = blockIdx.x;
@@ -372,6 +535,7 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int32_t *__restr
 static cublasHandle_t g_cublasHandle = nullptr;
 static cublasLtHandle_t g_ltHandle = nullptr;
 static int g_gemm_mode = 0; /* 1 = cuBLASLt per-shape plans, 0 = cublasGemmEx */
+static int g_attn_wmma = 0; /* 1 = tensor-core flash attention, 0 = tiled fp32 attention */
 static void *g_ltWs = nullptr;
 static size_t g_ltWsBytes = 0;
 
@@ -687,6 +851,20 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     g_profile = penv && std::atoi(penv) == 1;
     if (g_profile && prof_init(2048) != 0) g_profile = false;
 
+    const char *aenv = std::getenv("INFERIO_ATTN");
+    g_attn_wmma = (aenv && std::strcmp(aenv, "wmma") == 0) ? 1 : 0;
+    if (g_attn_wmma) {
+        cudaError_t e = cudaFuncSetAttribute((const void *)attn_wmma_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             kAttnSmemBytes);
+        if (e != cudaSuccess) {
+            g_attn_wmma = 0;
+            cudaGetLastError();
+        }
+    }
+    std::printf("INFERIO_INIT attn=%s\n", g_attn_wmma ? "wmma" : "tiled");
+    std::fflush(stdout);
+
     int rc = load_model(model_dir);
     if (rc) return rc;
     g_m.loaded = true;
@@ -769,9 +947,15 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             if (g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
-            dim3 agrid((seqlen + 127) / 128, kHeads, gn);
-            attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
-                                                             attn_scale_log2e);
+            if (g_attn_wmma) {
+                dim3 wgrid((seqlen + kAttnBr - 1) / kAttnBr, kHeads, gn);
+                attn_wmma_kernel<<<wgrid, 128, kAttnSmemBytes>>>(g_m.qkv, g_m.att, seqlen,
+                                                                 attn_scale_log2e);
+            } else {
+                dim3 agrid((seqlen + 127) / 128, kHeads, gn);
+                attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
+                                                                 attn_scale_log2e);
+            }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
 
