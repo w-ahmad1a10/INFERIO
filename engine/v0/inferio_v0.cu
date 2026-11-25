@@ -446,17 +446,15 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
     const int qmax = qrow0 + 15;
     const int n_tiles = (qmax + 64) / 64;
 
-    // K and V tiles staged in shared memory, one buffer reused: K for the QK
-    // mma phase, V (overwriting K) for the PV phase. Keeps smem at 9 KB so
-    // occupancy is unchanged vs v0.9; stride 72 halves avoids bank conflicts.
-    __shared__ __half attn_kv[64 * 72];
+    // V tile staged in shared memory (stride 72 halves to avoid bank conflicts).
+    __shared__ __half attn_vs[64 * 72];
 
     for (int tile = 0; tile < n_tiles; ++tile) {
         const int k0 = tile * 64;
         for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
             const int kk = i >> 6;
             const int dd = i & 63;
-            attn_kv[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + kD + dd];
+            attn_vs[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + 2 * kD + dd];
         }
         __syncthreads();
         float c[8][4];
@@ -464,15 +462,13 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
         for (int kg = 0; kg < 8; ++kg) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) c[kg][i] = 0.f;
+            const __half *kb = qkv_g + (long)(k0 + kg * 8 + g) * row_stride + kD;
 #pragma unroll
             for (int dch = 0; dch < 8; ++dch) {
-                __half2 h2 = __halves2half2(attn_kv[(kg * 8 + g) * 72 + dch * 8 + t * 2],
-                                            attn_kv[(kg * 8 + g) * 72 + dch * 8 + t * 2 + 1]);
-                const unsigned b0 = *reinterpret_cast<unsigned *>(&h2);
+                const unsigned b0 = *reinterpret_cast<const unsigned *>(kb + dch * 8 + t * 2);
                 mma_f16(c[kg], qa[dch][0], qa[dch][1], b0);
             }
         }
-        __syncthreads();  // K reads complete before the V load overwrites the buffer
 
         float tmax_r = -1e30f, tmax_r8 = -1e30f;
 #pragma unroll
@@ -529,20 +525,12 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
         m_r = mn_r;
         m_r8 = mn_r8;
 
-        // V tile overwrites the K tile in shared memory for the PV phase.
-        for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
-            const int kk = i >> 6;
-            const int dd = i & 63;
-            attn_kv[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + 2 * kD + dd];
-        }
-        __syncthreads();
-
 #pragma unroll
         for (int kg = 0; kg < 8; ++kg) {
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
-                __half2 h2 = __halves2half2(attn_kv[(kg * 8 + t * 2) * 72 + n * 8 + g],
-                                            attn_kv[(kg * 8 + t * 2 + 1) * 72 + n * 8 + g]);
+                __half2 h2 = __halves2half2(attn_vs[(kg * 8 + t * 2) * 72 + n * 8 + g],
+                                            attn_vs[(kg * 8 + t * 2 + 1) * 72 + n * 8 + g]);
                 const unsigned b0 = *reinterpret_cast<unsigned *>(&h2);
                 mma_f16(o[n], pa[kg][0], pa[kg][1], b0);
             }
