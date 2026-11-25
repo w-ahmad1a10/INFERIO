@@ -445,8 +445,17 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
     const int qmax = qrow0 + 15;
     const int n_tiles = (qmax + 64) / 64;
 
+    // V tile staged in shared memory (stride 72 halves to avoid bank conflicts).
+    __shared__ __half attn_vs[64 * 72];
+
     for (int tile = 0; tile < n_tiles; ++tile) {
         const int k0 = tile * 64;
+        for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+            const int kk = i >> 6;
+            const int dd = i & 63;
+            attn_vs[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + 2 * kD + dd];
+        }
+        __syncthreads();
         float c[8][4];
 #pragma unroll
         for (int kg = 0; kg < 8; ++kg) {
@@ -519,13 +528,13 @@ __global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restri
         for (int kg = 0; kg < 8; ++kg) {
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
-                const __half *vb = qkv_g + (long)(k0 + kg * 8 + t * 2) * row_stride + 2 * kD +
-                                   n * 8 + g;
-                __half2 h2 = __halves2half2(vb[0], vb[row_stride]);
+                __half2 h2 = __halves2half2(attn_vs[(kg * 8 + t * 2) * 72 + n * 8 + g],
+                                            attn_vs[(kg * 8 + t * 2 + 1) * 72 + n * 8 + g]);
                 const unsigned b0 = *reinterpret_cast<unsigned *>(&h2);
                 mma_f16(o[n], pa[kg][0], pa[kg][1], b0);
             }
         }
+        __syncthreads();
     }
 
     const float inv_r = l_r > 0.f ? 1.f / l_r : 0.f;
