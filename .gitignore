@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Kaggle driver — kaggle.env holds a live notebook token; never commit it
+kaggle/kaggle.env
+kaggle/.venv/
+
+# Large third-party clones kept locally for study (pinned in study/SOURCES.md)
+study/vendor/
+
+# Local scratch
+temp/local/
