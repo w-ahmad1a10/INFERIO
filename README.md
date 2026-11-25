@@ -1,8 +1,9 @@
 # INFERIO
 
 A custom inference engine for **GPT-2 on NVIDIA T4 (Turing, SM 7.5)**, built to
-maximize **prefill throughput at long context (4096 tokens)** across batch sizes
-1–1024, using hand-written C/C++/CUDA (plus Triton for kernel prototyping).
+maximize **prefill throughput at 1024-token context** (GPT-2's native window)
+across batch sizes 1–1024, using hand-written C/C++/CUDA (plus Triton for kernel
+prototyping).
 
 No PyTorch, no vLLM, no heavy frameworks. Allowed building blocks: CUDA C/C++,
 Triton, cuBLAS/cuBLASLt, CUTLASS, cuDNN.
@@ -10,7 +11,7 @@ Triton, cuBLAS/cuBLASLt, CUTLASS, cuDNN.
 ## Fixed benchmark
 
 - Model: GPT-2 small (124M params, 12 layers, 768 hidden, 12 heads, FFN 3072, vocab 50257).
-- Prompt: exactly 4096 random token ids per sequence (fixed seed; input hashes recorded).
+- Prompt: exactly 1024 random token ids per sequence (fixed seed; input hashes recorded).
 - Batch sizes tested: 1, 4, 16, 32, 64, 128, 256, 512, 1024.
 - Metric: prefill latency (tokens in → last-position logits / first greedy token).
 - OOM is caught and recorded per batch size — never a crash.
