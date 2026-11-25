@@ -30,6 +30,19 @@ Read in full. Key facts applied:
   clock-adjusted cuBLAS ceiling); v0.3 36.9 s regression from smem-tiled
   attention (occupancy); tanh.approx GELU cut fc1 3.77 s → 2.15 s.
 
+### FlashAttention-2 paper (arXiv 2307.08691, pages 1–8: abstract, background, §3.1–3.2)
+Read. Applied/confirmed in the PTX MMA attention kernel:
+- Non-matmul ops (exp, rescale) cost up to 16× a matmul op → measure and minimize
+  them (we use exp2 with folded scale; one O-rescale per 64-key tile).
+- Keep O unnormalized during the loop, divide once at the end (ours does exactly
+  this via l_r/l_r8).
+- Parallelize over the sequence (query-tile) dimension for occupancy → our
+  grid.x = 64-query tiles per head per sequence; score fragments stay in
+  registers (the m16n8k8 C-layout == the PV A-layout), so no smem score trip.
+- Skip fully-masked causal tiles (ours: n_tiles = qc + 1).
+- Their remaining lever vs ours: finer warp work partitioning and staged K/V in
+  smem (V staging is landing in v0.8.0).
+
 ## Pending reads (not yet done — tracked honestly)
 
 - CUDA C++ Programming Guide (downloaded) — targeted sections as needed.
