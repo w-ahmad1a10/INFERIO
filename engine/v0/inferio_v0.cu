@@ -426,13 +426,7 @@ __global__ void attn_wmma_kernel(const __half *__restrict__ qkv, __half *__restr
     const int qmax = min(qc * kAttnBr + kAttnBr - 1, seq - 1);
     const int n_tiles = (qmax + kAttnBc) / kAttnBc;
 
-    using wmma::accumulator;
-    using wmma::col_major;
-    using wmma::fragment;
-    using wmma::matrix_a;
-    using wmma::matrix_b;
-    using wmma::mem_row_major;
-    using wmma::row_major;
+    using namespace nvcuda;
 
     // Pass A: row max of scaled scores.
     for (int t = 0; t < n_tiles; ++t) {
@@ -726,7 +720,7 @@ static cublasStatus_t gemm_xwt(const __half *X, const __half *Wt, __half *C, lon
                                long N) {
     float beta = 0.0f;
     if (g_gemm_mode == 1 && g_ltHandle) {
-        LtPlan *p = lt_get_plan(M, K, N, 1);
+        LtPlan *p = lt_get_plan(M, K, N, 1, 0);
         if (p) {
             float alpha = 1.0f;
             return cublasLtMatmul(g_ltHandle, p->op_desc, &alpha, Wt, p->a_desc, X, p->b_desc,
