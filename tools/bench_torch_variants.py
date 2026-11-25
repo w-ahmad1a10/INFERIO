@@ -32,9 +32,13 @@ def sha_self():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True, choices=["eager-nocache", "compile"])
+    ap.add_argument("--batches", default=",".join(str(b) for b in BATCHES))
+    ap.add_argument("--no-dynamic", action="store_true",
+                    help="compile without dynamic=True (specialize per shape)")
     ap.add_argument("--results-root", default="temp")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
+    batches = [int(x) for x in args.batches.split(",")]
 
     from transformers import GPT2LMHeadModel
 
@@ -47,7 +51,7 @@ def main():
 
     transformer = model.transformer
     if args.variant == "compile":
-        transformer = torch.compile(transformer, dynamic=True)
+        transformer = torch.compile(transformer, dynamic=not args.no_dynamic)
 
     def one(ids):
         st = torch.cuda.Event(enable_timing=True)
@@ -62,7 +66,7 @@ def main():
 
     run_id = time.strftime("%Y%m%d-%H%M%SZ", time.gmtime()) + f"-pytorch-{args.variant}"
     rows = []
-    for b in BATCHES:
+    for b in batches:
         ids = ids_for_batch(b)
         ids_sha = hashlib.sha256(ids.tobytes()).hexdigest()
         try:
@@ -89,7 +93,7 @@ def main():
         "run_id": run_id,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "engine": f"pytorch-{args.variant}-{torch.__version__} (HF GPT-2, fp16, "
-                  f"use_cache=False{' + torch.compile(dynamic=True)' if args.variant == 'compile' else ''})",
+                  f"use_cache=False{' + torch.compile' + ('(dynamic=True)' if not args.no_dynamic else '(specialized)') if args.variant == 'compile' else ''})",
         "harness_sha256": sha_self(),
         "device_env": nvidia_snapshot(),
         "note": args.note,
