@@ -213,34 +213,55 @@ __global__ void ln_kernel(const __half *__restrict__ x, const __half *__restrict
     }
 }
 
+// Vectorized (half2) bias add. total2 = number of half2 elements, N2 = row width in half2.
 __global__ void bias_add_kernel(__half *__restrict__ y, const __half *__restrict__ bias,
-                                long total, int N) {
+                                long total2, int N2) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    int c = (int)(i % N);
-    y[i] = __float2half(__half2float(y[i]) + __half2float(bias[c]));
+    if (i >= total2) return;
+    const int c = (int)(i % N2);
+    __half2 *y2 = reinterpret_cast<__half2 *>(y);
+    const __half2 *b2 = reinterpret_cast<const __half2 *>(bias);
+    float2 f = __half22float2(y2[i]);
+    float2 bf = __half22float2(b2[c]);
+    y2[i] = __floats2half2_rn(f.x + bf.x, f.y + bf.y);
+}
+
+__device__ __forceinline__ float tanh_approx(float x) {
+    float r;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
 }
 
 __device__ __forceinline__ float gelu_new(float x) {
-    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    return 0.5f * x * (1.0f + tanh_approx(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
 
 __global__ void bias_gelu_kernel(__half *__restrict__ y, const __half *__restrict__ bias,
-                                 long total, int N) {
+                                 long total2, int N2) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total) return;
-    int c = (int)(i % N);
-    y[i] = __float2half(gelu_new(__half2float(y[i]) + __half2float(bias[c])));
+    if (i >= total2) return;
+    const int c = (int)(i % N2);
+    __half2 *y2 = reinterpret_cast<__half2 *>(y);
+    const __half2 *b2 = reinterpret_cast<const __half2 *>(bias);
+    float2 f = __half22float2(y2[i]);
+    float2 bf = __half22float2(b2[c]);
+    y2[i] = __floats2half2_rn(gelu_new(f.x + bf.x), gelu_new(f.y + bf.y));
 }
 
-// One thread per query row; online softmax (flash-style, no S x S materialization).
-// qkv layout: [rows, 2304] with q = [0:768], k = [768:1536], v = [1536:2304].
+// One thread per query row; tiled online softmax in log2 domain (exp2f), one
+// accumulator rescale per 64-key tile instead of per key. Scores for the tile
+// are staged in shared memory. qkv layout: [rows, 2304], q|k|v thirds.
+#define kBC 64
+
 __global__ void attn_kernel(const __half *__restrict__ qkv, __half *__restrict__ out, int seq,
-                            float scale) {
+                            float scale_log2e) {
     const int qrow = blockIdx.x * blockDim.x + threadIdx.x;
     const int h = blockIdx.y;
     const int g = blockIdx.z;
     if (qrow >= seq) return;
+
+    extern __shared__ float sc[];
+    float *srow = sc + threadIdx.x * (kBC + 1);
 
     const long row_stride = kQKV;
     const __half *qbase = qkv + ((long)g * seq + qrow) * row_stride + h * kHeadDim;
@@ -251,36 +272,53 @@ __global__ void attn_kernel(const __half *__restrict__ qkv, __half *__restrict__
     const __half *kbase0 = qkv + (long)g * seq * row_stride + kD + h * kHeadDim;
     const __half *vbase0 = qkv + (long)g * seq * row_stride + 2 * kD + h * kHeadDim;
 
-    float m = -1e30f;
+    float m2 = -1e30f;  // running max in log2 domain
     float l = 0.f;
     float acc[kHeadDim];
 #pragma unroll
     for (int d = 0; d < kHeadDim; ++d) acc[d] = 0.f;
 
-    for (int k = 0; k <= qrow; ++k) {
-        const __half *kb = kbase0 + (long)k * row_stride;
-        float s = 0.f;
+    const int n_tiles = (qrow + kBC) / kBC;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int k0 = t * kBC;
+        const int kend = min(kBC, qrow - k0 + 1);
+
+        float tmax = -1e30f;
+        for (int kk = 0; kk < kend; ++kk) {
+            const __half *kb = kbase0 + (long)(k0 + kk) * row_stride;
+            float s = 0.f;
 #pragma unroll
-        for (int d = 0; d < kHeadDim; d += 2) {
-            __half2 kv = *reinterpret_cast<const __half2 *>(kb + d);
-            float2 f = __half22float2(kv);
-            s += q[d] * f.x + q[d + 1] * f.y;
+            for (int d = 0; d < kHeadDim; d += 2) {
+                __half2 kv = *reinterpret_cast<const __half2 *>(kb + d);
+                float2 f = __half22float2(kv);
+                s += q[d] * f.x + q[d + 1] * f.y;
+            }
+            s *= scale_log2e;
+            srow[kk] = s;
+            tmax = fmaxf(tmax, s);
         }
-        s *= scale;
-        const float m_new = fmaxf(m, s);
-        const float p = __expf(s - m_new);
-        const float corr = __expf(m - m_new);
-        l = l * corr + p;
-        const __half *vb = vbase0 + (long)k * row_stride;
+
+        const float m2_new = fmaxf(m2, tmax);
+        const float corr = exp2f(m2 - m2_new);
 #pragma unroll
-        for (int d = 0; d < kHeadDim; d += 2) {
-            __half2 vv = *reinterpret_cast<const __half2 *>(vb + d);
-            float2 f = __half22float2(vv);
-            acc[d] = acc[d] * corr + p * f.x;
-            acc[d + 1] = acc[d + 1] * corr + p * f.y;
+        for (int d = 0; d < kHeadDim; ++d) acc[d] *= corr;
+        float lsum = 0.f;
+        for (int kk = 0; kk < kend; ++kk) {
+            const float p = exp2f(srow[kk] - m2_new);
+            lsum += p;
+            const __half *vb = vbase0 + (long)(k0 + kk) * row_stride;
+#pragma unroll
+            for (int d = 0; d < kHeadDim; d += 2) {
+                __half2 vv = *reinterpret_cast<const __half2 *>(vb + d);
+                float2 f = __half22float2(vv);
+                acc[d] = fmaf(p, f.x, acc[d]);
+                acc[d + 1] = fmaf(p, f.y, acc[d + 1]);
+            }
         }
-        m = m_new;
+        l = l * corr + lsum;
+        m2 = m2_new;
     }
+
     const float inv = (l > 0.f) ? 1.0f / l : 0.0f;
     __half *ob = out + ((long)g * seq + qrow) * kD + h * kHeadDim;
 #pragma unroll
@@ -680,7 +718,7 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
         return set_error(INFERIO_ERR_IO, "missing top-level tensors", __FILE__, __LINE__);
 
     const int group = g_m.group_seqs;
-    const float attn_scale = 1.0f / std::sqrt((float)kHeadDim);
+    const float attn_scale_log2e = (1.0f / std::sqrt((float)kHeadDim)) * 1.4426950408889634f;
 
     CUDA_CK(cudaEventRecord(g_ev0, 0));
     CUDA_CK(cudaMemcpyAsync(g_m.ids_dev, host_ids, (size_t)batch * seqlen * sizeof(int32_t),
@@ -723,24 +761,26 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             ph = prof_begin(INFERIO_PHASE_QKV);
             CUBLAS_CK(gemm_xw(g_m.xn, qkvw->dev, g_m.qkv, tr, kD, kQKV, 0.0f));
             {
-                long total = tr * kQKV;
-                bias_add_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.qkv, qkvb->dev, total,
-                                                                     kQKV);
+                long total2 = tr * kQKV / 2;
+                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.qkv, qkvb->dev, total2,
+                                                                     kQKV / 2);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
             dim3 agrid((seqlen + 127) / 128, kHeads, gn);
-            attn_kernel<<<agrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale);
+            attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
+                                                             attn_scale_log2e);
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_PROJ);
             CUBLAS_CK(gemm_xw(g_m.att, pw->dev, g_m.x, tr, kD, kD, 1.0f));
             {
-                long total = tr * kD;
-                bias_add_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.x, pb->dev, total, kD);
+                long total2 = tr * kD / 2;
+                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.x, pb->dev, total2,
+                                                                     kD / 2);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("05_proj_x", g_m.x, (size_t)tr * kD * 2);
@@ -753,9 +793,9 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             ph = prof_begin(INFERIO_PHASE_FC1);
             CUBLAS_CK(gemm_xw(g_m.xn, f1w->dev, g_m.ffn, tr, kD, kFF, 0.0f));
             {
-                long total = tr * kFF;
-                bias_gelu_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.ffn, f1b->dev, total,
-                                                                      kFF);
+                long total2 = tr * kFF / 2;
+                bias_gelu_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.ffn, f1b->dev, total2,
+                                                                      kFF / 2);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("07_fc1_gelu", g_m.ffn, (size_t)tr * kFF * 2);
@@ -763,8 +803,9 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             ph = prof_begin(INFERIO_PHASE_FC2);
             CUBLAS_CK(gemm_xw(g_m.ffn, f2w->dev, g_m.x, tr, kFF, kD, 1.0f));
             {
-                long total = tr * kD;
-                bias_add_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.x, f2b->dev, total, kD);
+                long total2 = tr * kD / 2;
+                bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.x, f2b->dev, total2,
+                                                                     kD / 2);
             }
             prof_end(ph);
             if (g0 == 0 && l == 0) dump_tensor("08_fc2_x", g_m.x, (size_t)tr * kD * 2);

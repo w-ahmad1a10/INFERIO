@@ -9,8 +9,8 @@ cmd = (
     '--weights /kaggle/working/weights_gpt2 --golden /kaggle/working/golden '
     '--out temp/results/parity.json && echo ==== PARITY_PASS ==== && '
     'INFERIO_COMMIT=$(git rev-parse --short HEAD) python3 bench/bench_prefill.py --all '
-    '--gpu 0 --profile --note "v0.2.0: cuBLASLt per-shape algo plans for all GEMMs '
-    '+ vectorized LayerNorm (half2); still naive attention"'
+    '--gpu 0 --profile --note "v0.3.0: tiled online-softmax attention (exp2, per-tile '
+    'rescale, smem score staging) + tanh.approx GELU + half2 bias kernels"'
 )
 r = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=1750)
 print(r.stdout[-12000:])
