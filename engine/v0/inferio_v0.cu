@@ -407,11 +407,8 @@ __device__ __forceinline__ unsigned pack_half2(float x, float y) {
     return *reinterpret_cast<unsigned *>(&h);
 }
 
-// launch_bounds(128, 5): cap registers so 5 blocks (640 threads) fit per SM
-// (v0.9 used ~110 regs -> 4 blocks); more warps feed the SFU better.
-__global__ __launch_bounds__(128, 5) void attn_mma_kernel(const __half *__restrict__ qkv,
-                                                          __half *__restrict__ out,
-                                                          int seq, float scale_log2e) {
+__global__ void attn_mma_kernel(const __half *__restrict__ qkv, __half *__restrict__ out,
+                                int seq, float scale_log2e) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int g = lane >> 2;
