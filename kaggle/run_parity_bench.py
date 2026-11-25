@@ -2,8 +2,9 @@ import subprocess
 import sys
 
 cmd = (
-    'cd /kaggle/working/INFERIO && git pull -q origin main && '
-    'make -C engine -j 2>&1 | tail -3 && '
+    'cd /kaggle/working && rm -rf INFERIO && '
+    'git clone -q https://github.com/w-ahmad1a10/INFERIO.git && '
+    'cd INFERIO && make -C engine -j 2>&1 | tail -3 && '
     'python3 bench/parity_check.py --lib engine/build/libinferio.so '
     '--weights /kaggle/working/weights_gpt2 --golden /kaggle/working/golden '
     '--out temp/results/parity.json && echo ==== PARITY_PASS ==== && '
