@@ -22,13 +22,19 @@ Triton, cuBLAS/cuBLASLt, CUTLASS, cuDNN.
 
 | path | purpose |
 |---|---|
-| `bench/` | frozen benchmark harness (any change is announced; hash-verified) _(planned)_ |
-| `engine/` | the inference engine (C/C++/CUDA + Triton) _(planned)_ |
+| `bench/` | frozen benchmark harness (any change is announced; hash-verified) |
+| `engine/` | the inference engine (C/C++/CUDA + Triton) |
+| `tools/` | weight conversion, fp32 numpy oracle, debug comparators |
+| `docs/` | profiling guide and other operational documentation |
 | `kaggle/` | driver to execute code on the remote Kaggle T4 x2 notebook |
 | `study/` | downloaded papers/docs/repos used as references, with an index |
-| `temp/` | every measured result + the step-by-step ledger _(created with the first run)_ |
+| `temp/` | every measured result + the step-by-step ledger |
 
-## Status
+## Status (2026-11-25)
 
-Step 1: design brainstorm (nothing built yet). Progress is recorded factually in
-`temp/LEDGER.md` starting with the first measured run.
+- Frozen benchmark SPEC v1 + harness committed; correctness gate is a parity
+  check against an fp32 numpy oracle (`tools/oracle_gpt2.py`).
+- Engine v0 (correct-first: cuBLAS fp16 GEMMs + naive online-softmax attention,
+  sequence-streaming) builds on the Kaggle T4 and passes stage-level checks
+  against the numpy reference.
+- First full 9-batch measurement is running; results land in `temp/LEDGER.md`.
