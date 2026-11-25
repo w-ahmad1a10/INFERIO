@@ -11,3 +11,8 @@ study/vendor/
 
 # Local scratch
 temp/local/
+temp/prof/
+
+# Builds and numpy artifacts
+engine/build/
+*.npy
