@@ -9,7 +9,7 @@ cmd = (
     'CUDA_VISIBLE_DEVICES=1 INFERIO_ATTN=wmma python3 bench/parity_check.py '
     '--lib engine/build/libinferio.so --weights /kaggle/working/weights_gpt2 '
     '--golden /kaggle/working/golden --out temp/results/parity_wmma.json; '
-    'echo ==== SCREEN (GPU0 simple | GPU1 wmma, in parallel) ==== && '
+    'echo "==== SCREEN: GPU0 simple vs GPU1 wmma ====" && '
     '( CUDA_VISIBLE_DEVICES=1 INFERIO_ATTN=wmma INFERIO_PROFILE=1 python3 tools/quick_compare.py '
     '--lib engine/build/libinferio.so --weights /kaggle/working/weights_gpt2 '
     '--batches 64,256,1024 --iters 2 > /kaggle/working/screen_wmma.txt 2>&1 ) & W=$!; '
