@@ -34,7 +34,7 @@ int main() {
     cudaSetDevice(0);
     cudaDeviceProp p;
     cudaGetDeviceProperties(&p, 0);
-    printf("device=%s sms=%d clock=%d kHz\n", p.name, p.multiProcessorCount, p.clockRate);
+    printf("device=%s sms=%d\n", p.name, p.multiProcessorCount);
 
     int blocks = p.multiProcessorCount * 8, threads = 256;
     long n = 1L << 30;
