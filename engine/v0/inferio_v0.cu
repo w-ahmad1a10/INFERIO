@@ -60,6 +60,16 @@ static int cublas_check(cublasStatus_t s, const char *what, const char *file, in
         if (_rc) return _rc;                                                 \
     } while (0)
 
+// CUDA graph replay (B=1 campaign): the whole compute runs on g_stream; the
+// first prefill runs direct (creates cuBLASLt plans), later prefills capture
+// once and replay the graph.
+static cudaStream_t g_stream = nullptr;
+static cudaGraph_t g_graph = nullptr;
+static cudaGraphExec_t g_graphExec = nullptr;
+static bool g_graph_mode = false;
+static long long g_graph_shape = -1;  // batch * 1000000 + seqlen + group
+static int g_prefill_count = 0;
+
 // ------------------------------------------------------ allocation tracking --
 static long long g_cur_bytes = 0;
 static long long g_peak_bytes = 0;
@@ -865,7 +875,7 @@ static cublasStatus_t gemm_xw_bias(const __half *X, const __half *W, __half *C, 
     cublasStatus_t s = gemm_ex_raw(X, W, C, M, K, N, beta);
     if (s != CUBLAS_STATUS_SUCCESS) return s;
     long total2 = M * N / 2;
-    bias_add_kernel<<<(int)((total2 + 255) / 256), 256>>>(C, bias, total2, (int)(N / 2));
+    bias_add_kernel<<<(int)((total2 + 255) / 256), 256, 0, g_stream>>>(C, bias, total2, (int)(N / 2));
     return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -983,6 +993,17 @@ static int ensure_buffers(int batch, int seqlen) {
         return 0;
     }
 
+    // Buffers are about to move: any captured graph would hold stale pointers.
+    if (g_graphExec) {
+        cudaGraphExecDestroy(g_graphExec);
+        g_graphExec = nullptr;
+    }
+    if (g_graph) {
+        cudaGraphDestroy(g_graph);
+        g_graph = nullptr;
+    }
+    g_graph_shape = -1;
+
     dev_free(g_m.x, g_m.x_bytes);
     dev_free(g_m.xn, g_m.xn_bytes);
     dev_free(g_m.qkv, g_m.qkv_bytes);
@@ -1089,6 +1110,16 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     CUDA_CK(cudaEventCreate(&g_ev0));
     CUDA_CK(cudaEventCreate(&g_ev1));
 
+    CUDA_CK(cudaStreamCreate(&g_stream));
+    if (g_cublasHandle) cublasSetStream(g_cublasHandle, g_stream);
+    if (g_ltHandle) cublasLtSetStream(g_ltHandle, g_stream);
+    {
+        const char *genv2 = std::getenv("INFERIO_GRAPH");
+        g_graph_mode = (genv2 && std::atoi(genv2) == 0) ? false : true;
+    }
+    std::printf("INFERIO_INIT graph=%s\n", g_graph_mode ? "on" : "off");
+    std::fflush(stdout);
+
     const char *penv = std::getenv("INFERIO_PROFILE");
     g_profile = penv && std::atoi(penv) == 1;
     if (g_profile && prof_init(2048) != 0) g_profile = false;
@@ -1142,21 +1173,18 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
     const int group = g_m.group_seqs;
     const float attn_scale_log2e = (1.0f / std::sqrt((float)kHeadDim)) * 1.4426950408889634f;
 
-    CUDA_CK(cudaEventRecord(g_ev0, 0));
-    CUDA_CK(cudaMemcpyAsync(g_m.ids_dev, host_ids, (size_t)batch * seqlen * sizeof(int32_t),
-                            cudaMemcpyHostToDevice, 0));
-
+    auto run_compute = [&](bool events_on) -> int {
     for (int g0 = 0; g0 < batch; g0 += group) {
         const int gn = std::min(group, batch - g0);
         const long tr = (long)gn * seqlen;
         {
-            int ph = prof_begin(INFERIO_PHASE_EMBED);
+            int ph = events_on ? prof_begin(INFERIO_PHASE_EMBED);
             long total = tr * kD;
             int blocks = (int)((total + 255) / 256);
-            embed_kernel<<<blocks, 256>>>(g_m.ids_dev + (size_t)g0 * seqlen, wte->dev, wpe->dev,
+            embed_kernel<<<blocks, 256, 0, g_stream>>>(g_m.ids_dev + (size_t)g0 * seqlen, wte->dev, wpe->dev,
                                           g_m.x, total, seqlen, kD);
             prof_end(ph);
-            if (g0 == 0) dump_tensor("01_embed_x", g_m.x, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0) dump_tensor("01_embed_x", g_m.x, (size_t)tr * kD * 2);
         }
 
         for (int l = 0; l < kNLayers; ++l) {
@@ -1175,66 +1203,66 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                 !f1b || !f2w || !f2b)
                 return set_error(INFERIO_ERR_IO, "missing layer tensors", __FILE__, __LINE__);
 
-            int ph = prof_begin(INFERIO_PHASE_LN);
-            ln_kernel<256><<<(int)tr, 256>>>(g_m.x, ln1w->dev, ln1b->dev, g_m.xn, kD, 1e-5f);
+            int ph = events_on ? prof_begin(INFERIO_PHASE_LN);
+            ln_kernel<256><<<(int)tr, 256, 0, g_stream>>>(g_m.x, ln1w->dev, ln1b->dev, g_m.xn, kD, 1e-5f);
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("02_ln1_xn", g_m.xn, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("02_ln1_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_QKV);
             CUBLAS_CK(gemm_xw_bias(g_m.xn, qkvw->dev, g_m.qkv, tr, kD, kQKV, 0.0f, qkvb->dev));
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("03_qkv", g_m.qkv, (size_t)tr * kQKV * 2);
 
             ph = prof_begin(INFERIO_PHASE_ATTN);
             if (g_attn_mode == 2) {
                 dim3 mgrid((seqlen + 63) / 64, kHeads, gn);
-                attn_mma_kernel<<<mgrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
+                attn_mma_kernel<<<mgrid, 128, 0, g_stream>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             } else if (g_attn_mode == 3) {
                 dim3 mgrid((seqlen + 63) / 64, kHeads, gn);
-                attn_mma128_kernel<<<mgrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
+                attn_mma128_kernel<<<mgrid, 128, 0, g_stream>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             } else if (g_attn_mode == 1) {
                 dim3 agrid((seqlen + 127) / 128, kHeads, gn);
-                attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4>>>(g_m.qkv, g_m.att, seqlen,
+                attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4, g_stream>>>(g_m.qkv, g_m.att, seqlen,
                                                                  attn_scale_log2e);
             } else {
                 dim3 agrid((seqlen + 127) / 128, kHeads, gn);
-                attn_kernel_simple<<<agrid, 128>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
+                attn_kernel_simple<<<agrid, 128, 0, g_stream>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             }
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("04_att", g_m.att, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_PROJ);
             CUBLAS_CK(gemm_xw_bias(g_m.att, pw->dev, g_m.x, tr, kD, kD, 1.0f, pb->dev));
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("05_proj_x", g_m.x, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("05_proj_x", g_m.x, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_LN);
-            ln_kernel<256><<<(int)tr, 256>>>(g_m.x, ln2w->dev, ln2b->dev, g_m.xn, kD, 1e-5f);
+            ln_kernel<256><<<(int)tr, 256, 0, g_stream>>>(g_m.x, ln2w->dev, ln2b->dev, g_m.xn, kD, 1e-5f);
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("06_ln2_xn", g_m.xn, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("06_ln2_xn", g_m.xn, (size_t)tr * kD * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC1);
             CUBLAS_CK(gemm_xw_bias(g_m.xn, f1w->dev, g_m.ffn, tr, kD, kFF, 0.0f, f1b->dev));
             {
                 long total2 = tr * kFF / 2;
-                gelu_kernel<<<(int)((total2 + 255) / 256), 256>>>(g_m.ffn, total2);
+                gelu_kernel<<<(int)((total2 + 255) / 256), 256, 0, g_stream>>>(g_m.ffn, total2);
             }
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("07_fc1_gelu", g_m.ffn, (size_t)tr * kFF * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("07_fc1_gelu", g_m.ffn, (size_t)tr * kFF * 2);
 
             ph = prof_begin(INFERIO_PHASE_FC2);
             CUBLAS_CK(gemm_xw_bias(g_m.ffn, f2w->dev, g_m.x, tr, kFF, kD, 1.0f, f2b->dev));
             prof_end(ph);
-            if (g0 == 0 && l == 0) dump_tensor("08_fc2_x", g_m.x, (size_t)tr * kD * 2);
+            if (events_on && g0 == 0 && l == 0) dump_tensor("08_fc2_x", g_m.x, (size_t)tr * kD * 2);
         }
 
-        int ph = prof_begin(INFERIO_PHASE_LN);
-        ln_kernel<256><<<(int)tr, 256>>>(g_m.x, lnf_w->dev, lnf_b->dev, g_m.xn, kD, 1e-5f);
+        int ph = events_on ? prof_begin(INFERIO_PHASE_LN);
+        ln_kernel<256><<<(int)tr, 256, 0, g_stream>>>(g_m.x, lnf_w->dev, lnf_b->dev, g_m.xn, kD, 1e-5f);
         prof_end(ph);
         if (g0 == 0) dump_tensor("09_final_xn", g_m.xn, (size_t)tr * kD * 2);
 
         ph = prof_begin(INFERIO_PHASE_HEAD);
-        gather_last_kernel<<<gn, 128>>>(g_m.xn, g_m.hlast, g0, seqlen, kD);
+        gather_last_kernel<<<gn, 128, 0, g_stream>>>(g_m.xn, g_m.hlast, g0, seqlen, kD);
         prof_end(ph);
     }
 
@@ -1242,19 +1270,59 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
     CUBLAS_CK(gemm_xwt(g_m.hlast, wte->dev, g_m.logits16, batch, kD, kVocab));
     {
         long total = (long)batch * kVocab;
-        cast_kernel<<<(int)((total + 255) / 256), 256>>>(g_m.logits16, g_m.logits32, total);
+        cast_kernel<<<(int)((total + 255) / 256), 256, 0, g_stream>>>(g_m.logits16, g_m.logits32, total);
     }
     prof_end(ph);
-    dump_tensor("10_hlast", g_m.hlast, (size_t)batch * kD * 2);
-    dump_tensor("11_logits32", g_m.logits32, (size_t)batch * kVocab * 4);
+    if (events_on) dump_tensor("10_hlast", g_m.hlast, (size_t)batch * kD * 2);
+    if (events_on) dump_tensor("11_logits32", g_m.logits32, (size_t)batch * kVocab * 4);
+    return 0;
+    };
 
-    CUDA_CK(cudaEventRecord(g_ev1, 0));
+    CUDA_CK(cudaEventRecord(g_ev0, g_stream));
+    CUDA_CK(cudaMemcpyAsync(g_m.ids_dev, host_ids, (size_t)batch * seqlen * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, g_stream));
+
+    ++g_prefill_count;
+    bool launched = false;
+    if (g_graph_mode && g_prefill_count > 1) {  // first call runs direct (plan creation)
+        if (!g_graphExec) {
+            const long long shape = (long long)batch * 1000000LL + seqlen + group;
+            cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeGlobal);
+            int crc = run_compute(false);
+            cudaStreamEndCapture(g_stream, &g_graph);
+            if (crc == 0 && g_graph) {
+                if (cudaGraphInstantiate(&g_graphExec, g_graph, 0) != cudaSuccess) {
+                    g_graphExec = nullptr;
+                    g_graph_mode = false;
+                } else {
+                    g_graph_shape = shape;
+                }
+            } else {
+                g_graph = nullptr;
+                g_graph_mode = false;
+            }
+        } else if (g_graph_shape != (long long)batch * 1000000LL + seqlen + group) {
+            cudaGraphExecDestroy(g_graphExec);
+            g_graphExec = nullptr;
+        }
+        if (g_graphExec) {
+            cudaGraphLaunch(g_graphExec, g_stream);
+            launched = true;
+        }
+    }
+    int rc = launched ? 0 : run_compute(true);
+    if (rc) {
+        st->rc = rc;
+        return rc;
+    }
+
+    CUDA_CK(cudaEventRecord(g_ev1, g_stream));
     {
         int aph = prof_begin(INFERIO_PHASE_ARGMAX);
-        argmax_kernel<<<batch, 256>>>(g_m.logits32, g_m.argmax_dev, kVocab);
+        argmax_kernel<<<batch, 256, 0, g_stream>>>(g_m.logits32, g_m.argmax_dev, kVocab);
         prof_end(aph);
     }
-    CUDA_CK(cudaStreamSynchronize(0));
+    CUDA_CK(cudaStreamSynchronize(g_stream));
 
     float ms = 0.f;
     cudaEventElapsedTime(&ms, g_ev0, g_ev1);
@@ -1333,6 +1401,13 @@ extern "C" void inferio_shutdown(void) {
     dev_free(g_m.argmax_dev, g_m.argmax_bytes);
     dev_free(g_m.ids_dev, g_m.ids_bytes);
     g_m = EngineState{};
+    if (g_graphExec) cudaGraphExecDestroy(g_graphExec);
+    if (g_graph) cudaGraphDestroy(g_graph);
+    g_graphExec = nullptr;
+    g_graph = nullptr;
+    if (g_stream) cudaStreamDestroy(g_stream);
+    g_stream = nullptr;
+    g_graph_mode = false;
     if (g_ev0) cudaEventDestroy(g_ev0);
     if (g_ev1) cudaEventDestroy(g_ev1);
     g_ev0 = g_ev1 = nullptr;
