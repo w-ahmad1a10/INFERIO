@@ -1366,6 +1366,9 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
             } else if (g_attn_mode == 3) {
                 dim3 mgrid((seqlen + 63) / 64, kHeads, gn);
                 attn_mma128_kernel<<<mgrid, 128, 0, g_stream>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
+            } else if (g_attn_mode == 4) {
+                dim3 mgrid((seqlen + 127) / 128, kHeads, gn);
+                attn_mma256_kernel<<<mgrid, 256, 0, g_stream>>>(g_m.qkv, g_m.att, seqlen, attn_scale_log2e);
             } else if (g_attn_mode == 1) {
                 dim3 agrid((seqlen + 127) / 128, kHeads, gn);
                 attn_kernel<<<agrid, 128, 128 * (kBC + 1) * 4, g_stream>>>(g_m.qkv, g_m.att, seqlen,
