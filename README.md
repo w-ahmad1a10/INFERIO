@@ -84,6 +84,16 @@ flavor on this box (measured). The KV allocation was torch's B=256 OOM cause
 - Explored and exhausted: cuBLASLt heuristic sweep (default optimal), group
   sizes 32–512, attention tile shapes, occupancy/register levers.
 
+### B=1 sector (2026-11-26 campaign, `b1/` folder)
+
+B=1-only optimization with its own frozen test (SPEC b1-v1). Same-session A/B
+chain at B=1: v0.12.2 16.9 ms → **CUDA graphs 12.25 ms (−27.5%)** → **mma256
+attention ~12 ms (−22%)** — roughly −30..40% total at B=1. Champion v0.14.1
+(graphs on by default; mma256 default in this sector, `INFERIO_ATTN=mma`
+restores the old attention). Cross-session official runs are clock-confounded
+(825–1410 MHz sessions); the same-session A/Bs are the valid record. Details
+and every run: `b1/LEDGER.md`, `b1/results/`.
+
 ### Engineering notes
 
 - Stack: pure CUDA C++ + inline PTX (`mma.sync.m16n8k8`) for all custom
