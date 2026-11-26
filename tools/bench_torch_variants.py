@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 
