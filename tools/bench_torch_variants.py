@@ -97,9 +97,9 @@ def main():
             for _ in range(ITERS):
                 ms, logits = one(ids)
                 ts.append(ms)
-                clk = max(clk, sample_clock_mhz())
+                clk = sample_clock_mhz()
             arg = logits.argmax(-1).cpu().numpy()
-            clk = sample_clock_mhz()
+            clk = max(clk, sample_clock_mhz())
             peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
             achieved_tflops = (b * SEQ * FLOPS_PER_TOKEN) / (statistics.median(ts) / 1000.0) / 1e12
             mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0
