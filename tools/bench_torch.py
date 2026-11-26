@@ -88,6 +88,7 @@ def main():
             for _ in range(ITERS):
                 ms, logits = one()
                 ts.append(ms)
+                clk = max(clk, sample_clock_mhz())
             arg = logits.argmax(-1).cpu().numpy()
             clk = sample_clock_mhz()
             peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0

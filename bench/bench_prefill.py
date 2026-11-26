@@ -123,6 +123,7 @@ def single_run(args):
             lib.inferio_shutdown()
             return out
         lat.append(st.prefill_ms)
+    clk = sample_clock_mhz()  # sampled under load; max() with the post-loop sample below
     arg = np.zeros(args.batch, dtype=np.int32)
     rc = lib.inferio_last_argmax(arg.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), args.batch)
     if rc != 0:
@@ -140,7 +141,7 @@ def single_run(args):
             if not np.array_equal(lg.argmax(-1), arg):
                 out["status"] = "error"
                 out["error"] = "argmax/logits mismatch"
-    clk = sample_clock_mhz()
+    clk = max(clk, sample_clock_mhz())  # loaded clock (post-loop sample may read idle)
     peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
     achieved_tflops = (args.batch * SEQ * FLOPS_PER_TOKEN) / (statistics.median(lat) / 1000.0) / 1e12
     mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0

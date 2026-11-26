@@ -145,8 +145,9 @@ def main():
                     ok = False
                     break
                 lat.append(st.prefill_ms)
-        if ok:
             clk = sample_clock_mhz()
+        if ok:
+            clk = max(clk, sample_clock_mhz())
             peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
             achieved_tflops = (BATCH * SEQ * FLOPS_PER_TOKEN) / (statistics.median(lat) / 1000.0) / 1e12
             mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0
