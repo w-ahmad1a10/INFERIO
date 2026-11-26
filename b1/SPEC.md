@@ -1,9 +1,13 @@
-# INFERIO B=1 frozen benchmark — SPEC b1-v1 (2026-11-26)
+# INFERIO B=1 frozen benchmark — SPEC b1-v2 (2026-11-26)
 
 This file and `bench_b1.py` are **FROZEN**. Any change is announced to the user
 first, bumps `B1_SPEC_VERSION`, and changes the harness hash embedded in every
 future result. The main 9-batch SPEC (`bench/SPEC.md`) is untouched by this
 campaign; this sector optimizes **batch size 1 only**.
+
+**b1-v2 (2026-11-26):** announced change — adds the MFU layer (same convention
+as SPEC v2): `clock_sm_mhz` sampled at the measured window, `peak_tflops`,
+`achieved_tflops`, `mfu`. Workload and metric unchanged from b1-v1.
 
 ## Workload
 

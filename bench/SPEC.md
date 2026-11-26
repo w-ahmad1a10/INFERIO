@@ -1,8 +1,18 @@
-# INFERIO frozen prefill benchmark — SPEC v1 (2026-11-25)
+# INFERIO frozen prefill benchmark — SPEC v2 (2026-11-26)
 
 This file and `bench_prefill.py` are **FROZEN**. Any change is announced to the
 user first, bumps `SPEC_VERSION`, and changes the harness hash embedded in every
 future result.
+
+**SPEC v2 (2026-11-26):** announced change — adds the MFU layer to every result
+row: `clock_sm_mhz` (SM clock sampled at that batch's measured window),
+`peak_tflops` (= 40 SMs × 1024 fp16 tensor-core flops/cycle × sampled clock),
+`achieved_tflops` (= B × 1024 tokens × 207.7 MFLOP/token ÷ median_s), and
+`mfu` (= achieved ÷ peak). Workload, metric window, batches, ids, and the ms
+metric are unchanged from v1; MFU is the clock-normalized diagnostic and the
+primary cross-session comparison metric. Convention note: 207.7 MFLOP/token
+counts full attention; the engine's causal attention computes half the scores,
+so engine-useful MFU is somewhat higher than the reported number.
 
 ## Model
 

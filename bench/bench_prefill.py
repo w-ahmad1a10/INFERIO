@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 
-SPEC_VERSION = "v1"
+SPEC_VERSION = "v2"
 BATCHES = [1, 4, 16, 32, 64, 128, 256, 512, 1024]
 SEQ = 1024
 VOCAB = 50257
@@ -24,6 +24,27 @@ SEED_BASE = 20261125
 WARMUP = 2
 ITERS = 5
 PHASES = ["embed", "ln", "qkv", "attn", "proj", "fc1", "fc2", "head", "argmax"]
+# SPEC v2: MFU layer. FLOPS_PER_TOKEN = 207.7 MFLOP (170M GEMM + 37.7M full
+# attention, standard MFU convention; our causal attention computes half the
+# scores, so engine-useful MFU is somewhat higher — convention frozen here).
+FLOPS_PER_TOKEN = 207.7e6
+# T4: 40 SMs x 1024 fp16 tensor-core flops/cycle/SM (65 TFLOPS @ 1590 MHz spec).
+SM_COUNT = 40
+FLOPS_PER_CYCLE = 1024
+
+
+def sample_clock_mhz():
+    """Instant SM clock of the physical GPU this child is pinned to."""
+    try:
+        phys = (os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip()
+        r = subprocess.run(
+            ["bash", "-lc",
+             "nvidia-smi --query-gpu=index,clocks.sm --format=csv,noheader "
+             "| awk -F', ' '$1==" + phys + "'"],
+            capture_output=True, text=True, timeout=30)
+        return int(r.stdout.strip().split()[1])
+    except Exception:
+        return 0
 
 
 class InferioStats(ctypes.Structure):
@@ -118,6 +139,10 @@ def single_run(args):
             if not np.array_equal(lg.argmax(-1), arg):
                 out["status"] = "error"
                 out["error"] = "argmax/logits mismatch"
+    clk = sample_clock_mhz()
+    peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
+    achieved_tflops = (args.batch * SEQ * FLOPS_PER_TOKEN) / (statistics.median(lat) / 1000.0) / 1e12
+    mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0
     out.update(
         median_ms=statistics.median(lat),
         min_ms=min(lat),
@@ -129,6 +154,10 @@ def single_run(args):
         group_seqs=st.group_seqs,
         n_groups=st.n_groups,
         argmax_first8=arg[:8].tolist(),
+        clock_sm_mhz=clk,
+        peak_tflops=peak_tflops,
+        achieved_tflops=achieved_tflops,
+        mfu=mfu,
     )
     if os.environ.get("INFERIO_PROFILE") == "1":
         out["phase_ms"] = {name: st.phase_ms[i] for i, name in enumerate(PHASES)}
@@ -157,15 +186,17 @@ def write_ledger_entry(path, results, note):
     lines.append(f"- **Change vs previous run:** {note or '(not specified)'}")
     lines.append(f"- device env: {'; '.join(results['device_env'])}")
     lines.append("")
-    lines.append("| B | status | median ms | min ms | max ms | tokens/s | peak GiB | group |")
-    lines.append("|---|--------|-----------|--------|--------|----------|----------|-------|")
+    lines.append("| B | status | median ms | min ms | max ms | tokens/s | peak GiB | group | clock MHz | peak TF/s | achieved TF/s | MFU |")
+    lines.append("|---|--------|-----------|--------|--------|----------|----------|-------|-----------|-----------|---------------|-----|")
     for r in results["rows"]:
         if r.get("status") == "ok":
             lines.append(f"| {r['batch']} | ok | {r['median_ms']:.2f} | {r['min_ms']:.2f} | "
                          f"{r['max_ms']:.2f} | {r['tokens_per_s']:.1f} | "
-                         f"{r['peak_bytes'] / 2**30:.2f} | {r['group_seqs']} |")
+                         f"{r['peak_bytes'] / 2**30:.2f} | {r['group_seqs']} | "
+                         f"{r.get('clock_sm_mhz', 0)} | {r.get('peak_tflops', 0):.1f} | "
+                         f"{r.get('achieved_tflops', 0):.2f} | {r.get('mfu', 0)*100:.1f}% |")
         else:
-            lines.append(f"| {r['batch']} | {r['status']} | – | – | – | – | – | – |")
+            lines.append(f"| {r['batch']} | {r['status']} | – | – | – | – | – | – | – | – | – | – |")
     lines.append("")
     lines.append(f"- only the rows above were measured; nothing inferred. "
                  f"full data: `{results['run_id']}.json`")

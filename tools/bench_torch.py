@@ -22,6 +22,24 @@ from bench_prefill import (BATCHES, ITERS, SEQ, WARMUP, ids_for_batch,  # noqa: 
 
 import torch  # noqa: E402
 
+# MFU layer (SPEC v2 convention): 207.7 MFLOP/token, T4 40 SMs x 1024 flops/cycle.
+FLOPS_PER_TOKEN = 207.7e6
+SM_COUNT = 40
+FLOPS_PER_CYCLE = 1024
+
+
+def sample_clock_mhz():
+    try:
+        phys = (os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip()
+        r = subprocess.run(
+            ["bash", "-lc",
+             "nvidia-smi --query-gpu=index,clocks.sm --format=csv,noheader "
+             "| awk -F', ' '$1==" + phys + "'"],
+            capture_output=True, text=True, timeout=30)
+        return int(r.stdout.strip().split()[1])
+    except Exception:
+        return 0
+
 
 def sha_self():
     with open(os.path.abspath(__file__), "rb") as f:
@@ -68,10 +86,16 @@ def main():
                 ms, logits = one()
                 ts.append(ms)
             arg = logits.argmax(-1).cpu().numpy()
+            clk = sample_clock_mhz()
+            peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
+            achieved_tflops = (b * SEQ * FLOPS_PER_TOKEN) / (statistics.median(ts) / 1000.0) / 1e12
+            mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0
             rows.append({"batch": b, "status": "ok", "median_ms": statistics.median(ts),
                          "min_ms": min(ts), "max_ms": max(ts), "latencies_ms": ts,
                          "tokens_per_s": b * SEQ / (statistics.median(ts) / 1000.0),
-                         "ids_sha256": ids_sha, "argmax_first8": arg[:8].tolist()})
+                         "ids_sha256": ids_sha, "argmax_first8": arg[:8].tolist(),
+                         "clock_sm_mhz": clk, "peak_tflops": peak_tflops,
+                         "achieved_tflops": achieved_tflops, "mfu": mfu})
             print(f"B={b} ok median={statistics.median(ts):.1f} ms")
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
@@ -100,15 +124,17 @@ def main():
         f"- **Note:** {args.note or '(not specified)'} — reference baseline only, not the engine.",
         f"- device env: {'; '.join(results['device_env'])}",
         "",
-        "| B | status | median ms | min ms | max ms | tokens/s |",
-        "|---|--------|-----------|--------|--------|----------|",
+        "| B | status | median ms | min ms | max ms | tokens/s | clock MHz | peak TF/s | achieved TF/s | MFU |",
+        "|---|--------|-----------|--------|--------|----------|-----------|-----------|---------------|-----|",
     ]
     for r in rows:
         if r["status"] == "ok":
             lines.append(f"| {r['batch']} | ok | {r['median_ms']:.2f} | {r['min_ms']:.2f} | "
-                         f"{r['max_ms']:.2f} | {r['tokens_per_s']:.1f} |")
+                         f"{r['max_ms']:.2f} | {r['tokens_per_s']:.1f} | "
+                         f"{r.get('clock_sm_mhz',0)} | {r.get('peak_tflops',0):.1f} | "
+                         f"{r.get('achieved_tflops',0):.2f} | {r.get('mfu',0)*100:.1f}% |")
         else:
-            lines.append(f"| {r['batch']} | oom | – | – | – | – |")
+            lines.append(f"| {r['batch']} | {r['status']} | – | – | – | – | – | – | – | – |")
     with open(os.path.join(args.results_root, "LEDGER.md"), "a") as f:
         f.write("\n".join(lines) + "\n")
     print("wrote", path, "and appended LEDGER.md")

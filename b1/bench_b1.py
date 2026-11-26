@@ -17,7 +17,7 @@ import time
 
 import numpy as np
 
-B1_SPEC_VERSION = "b1-v1"
+B1_SPEC_VERSION = "b1-v2"
 BATCH = 1
 SEQ = 1024
 VOCAB = 50257
@@ -25,6 +25,23 @@ SEED_BASE = 20261125
 WARMUP = 2
 ITERS = 5
 PHASES = ["embed", "ln", "qkv", "attn", "proj", "fc1", "fc2", "head", "argmax"]
+# b1-v2: MFU layer (same convention as SPEC v2).
+FLOPS_PER_TOKEN = 207.7e6
+SM_COUNT = 40
+FLOPS_PER_CYCLE = 1024
+
+
+def sample_clock_mhz():
+    try:
+        phys = (os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip()
+        r = subprocess.run(
+            ["bash", "-lc",
+             "nvidia-smi --query-gpu=index,clocks.sm --format=csv,noheader "
+             "| awk -F', ' '$1==" + phys + "'"],
+            capture_output=True, text=True, timeout=30)
+        return int(r.stdout.strip().split()[1])
+    except Exception:
+        return 0
 
 
 class InferioStats(ctypes.Structure):
@@ -127,6 +144,10 @@ def main():
                     break
                 lat.append(st.prefill_ms)
         if ok:
+            clk = sample_clock_mhz()
+            peak_tflops = SM_COUNT * FLOPS_PER_CYCLE * (clk * 1e6) / 1e12 if clk else 0.0
+            achieved_tflops = (BATCH * SEQ * FLOPS_PER_TOKEN) / (statistics.median(lat) / 1000.0) / 1e12
+            mfu = (achieved_tflops / peak_tflops) if peak_tflops else 0.0
             arg = np.zeros(BATCH, dtype=np.int32)
             rc = lib.inferio_last_argmax(
                 arg.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), BATCH)
@@ -144,6 +165,10 @@ def main():
                     weight_bytes=st.weight_bytes,
                     group_seqs=st.group_seqs,
                     argmax_first8=arg[:8].tolist(),
+                    clock_sm_mhz=clk,
+                    peak_tflops=peak_tflops,
+                    achieved_tflops=achieved_tflops,
+                    mfu=mfu,
                 )
                 if args.profile or os.environ.get("INFERIO_PROFILE") == "1":
                     out["phase_ms"] = {name: st.phase_ms[i] for i, name in enumerate(PHASES)}
@@ -177,9 +202,9 @@ def main():
     if r["status"] == "ok":
         lines.append(f"- B=1: **{r['median_ms']:.2f} ms = {r['tokens_per_s']:.0f} tok/s** "
                      f"(min {r['min_ms']:.2f} / max {r['max_ms']:.2f})")
-        if "phase_ms" in r:
-            ps = " ".join(f"{k}={v:.2f}" for k, v in r["phase_ms"].items() if v > 0.05)
-            lines.append(f"- phases: {ps}")
+        if "mfu" in r:
+            lines.append(f"- clock {r['clock_sm_mhz']} MHz | peak {r['peak_tflops']:.1f} TF/s | "
+                         f"achieved {r['achieved_tflops']:.2f} TF/s | **MFU {r['mfu']*100:.1f}%**")
     else:
         lines.append(f"- B=1: {r['status']} — {r['error']}")
     lines.append(f"- only the row above was measured; nothing inferred. "
