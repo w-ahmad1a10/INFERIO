@@ -33,12 +33,13 @@ FLOPS_PER_CYCLE = 1024
 
 def sample_clock_mhz():
     try:
-        phys = int((os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip())
+        # nvidia-smi filters its listing by CUDA_VISIBLE_DEVICES, so the
+        # child's device is always the first visible line.
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,clocks.sm", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30)
         lines = r.stdout.strip().splitlines()
-        return int(lines[phys].split(",")[1].strip().split()[0])
+        return int(lines[0].split(",")[1].strip().split()[0])
     except Exception:
         return 0
 
