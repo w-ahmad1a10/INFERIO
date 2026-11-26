@@ -94,6 +94,31 @@ restores the old attention). Cross-session official runs are clock-confounded
 (825–1410 MHz sessions); the same-session A/Bs are the valid record. Details
 and every run: `b1/LEDGER.md`, `b1/results/`.
 
+### MFU record (SPEC v2, 2026-11-26) — the clock-normalized official record
+
+All versions re-run with per-batch live SM clock sampling (MFU = achieved ÷
+peak, peak = 40 SMs × 1024 flops/cycle × sampled clock, 207.7 MFLOP/token).
+Full data: `temp/LEDGER_MFU.md`, `temp/results/`. v1 rows in `temp/LEDGER.md`
+stay as history.
+
+| version | B=1 MFU | B=128 MFU | B=1024 MFU |
+|---|---|---|---|
+| v0.1.0 | 12.0% | 15.3% | 13.1% |
+| v0.3.0 | 7.8% | 10.2% | 10.0% |
+| v0.7.0 | 35.5% | 23.2% | 23.2% |
+| v0.9.0 | 23.0% | 24.1% | 25.6% |
+| **v0.12.2** | **36.3%** | 26.1% | **26.9%** |
+| v0.13.1 | 30.8% | 24.2% | 25.8% |
+| **v0.14.1** | 27.4% | 25.8% | 26.5% |
+| torch-eager | 36.8% | 23.0% | OOM |
+| torch-compile | 36.1% | 22.0% | OOM |
+
+Reading: the tensor-core rewrite (v0.7) roughly doubles MFU at every batch;
+tuning since (v0.9–v0.14.1) adds a few points, with v0.12.2/v0.14.1 tied at
+the top (~26–27% at B=1024) — the remaining gap to the roofline is the
+SFU-bound attention exp2 work that MFU cannot count. Torch matches the engine
+at B=1 (36–37%) but falls behind with batch and cannot run B≥256 at all.
+
 ### Engineering notes
 
 - Stack: pure CUDA C++ + inline PTX (`mma.sync.m16n8k8`) for all custom

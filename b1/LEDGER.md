@@ -31,3 +31,4 @@
 ## Exploratory note `2026-11-26 mma256 A/B` — B=1
 - mma256 (256 threads, 128 queries/block, half the blocks) vs mma (128 threads, 64 queries/block), graph on, alternating 5 iters: paired deltas -6.9/-3.1/-3.7/+2.5 ms -> median **-22%** (3/4 pairs). Parity PASS (argmax [308] = golden). Accepted as default (v0.14.1); INFERIO_ATTN=mma restores the old default. Large-batch behavior of mma256 is unmeasured (B=1 sector only).
 - Combined campaign so far (same-session A/B chain): v0.12.2 16.9 -> graph 12.25 -> mma256 ~10-12 ms at B=1 (session-clock dependent), i.e. roughly -30..-40% total at B=1.
+
