@@ -38,7 +38,9 @@ def sample_clock_mhz():
             capture_output=True, text=True, timeout=30)
         lines = r.stdout.strip().splitlines()
         return int(lines[0].split(",")[1].strip().split()[0])
-    except Exception:
+    except Exception as e:
+        import sys as _s
+        print(f"INFERIO_CLOCK sampling failed: {e}", file=_s.stderr)
         return 0
 
 
