@@ -34,15 +34,13 @@ FLOPS_PER_CYCLE = 1024
 
 
 def sample_clock_mhz():
-    """Instant SM clock of the physical GPU this child is pinned to."""
     try:
-        phys = (os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip()
+        phys = int((os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] or "0").strip())
         r = subprocess.run(
-            ["bash", "-lc",
-             "nvidia-smi --query-gpu=index,clocks.sm --format=csv,noheader "
-             "| awk -F', ' '$1==" + phys + "'"],
+            ["nvidia-smi", "--query-gpu=index,clocks.sm", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30)
-        return int(r.stdout.strip().split()[1])
+        lines = r.stdout.strip().splitlines()
+        return int(lines[phys].split(",")[1])
     except Exception:
         return 0
 
