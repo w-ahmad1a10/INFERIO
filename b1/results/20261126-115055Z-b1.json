@@ -1,0 +1,53 @@
+{
+  "run_id": "20261126-115055Z-b1",
+  "timestamp_utc": "2026-11-26T11:50:58Z",
+  "engine_commit": "f6afc3c",
+  "engine_version": "v0.12.2",
+  "harness_sha256": "1c4999cb2bbaffcccd629e6695e562080b8006061456eed20a3b1329bcce8d75",
+  "weights_dir": "/kaggle/working/weights_gpt2",
+  "device_env": [
+    "0, Tesla T4, 580.178.04, 15360 MiB, 915 MHz, 58",
+    "1, Tesla T4, 580.178.04, 15360 MiB, 300 MHz, 50"
+  ],
+  "note": "v0.12.2 re-baseline on fresh card: B=1 campaign starting line",
+  "rows": [
+    {
+      "spec": "b1-v1",
+      "batch": 1,
+      "seq": 1024,
+      "harness_sha256": "1c4999cb2bbaffcccd629e6695e562080b8006061456eed20a3b1329bcce8d75",
+      "status": "ok",
+      "error": null,
+      "ids_sha256": "ed44f8e2a2e9c9d746349f4c8555e10242c673b374c507edbc9d9b809731b9e8",
+      "engine_version": "v0.12.2",
+      "median_ms": 15.12275218963623,
+      "min_ms": 15.095775604248047,
+      "max_ms": 15.147007942199707,
+      "latencies_ms": [
+        15.123519897460938,
+        15.106399536132812,
+        15.12275218963623,
+        15.147007942199707,
+        15.095775604248047
+      ],
+      "tokens_per_s": 67712.54247634615,
+      "peak_bytes": 365578730,
+      "weight_bytes": 248879616,
+      "group_seqs": 1,
+      "argmax_first8": [
+        308
+      ],
+      "phase_ms": {
+        "embed": 0.0,
+        "ln": 0.0,
+        "qkv": 0.0,
+        "attn": 0.0,
+        "proj": 0.0,
+        "fc1": 0.0,
+        "fc2": 0.0,
+        "head": 0.0,
+        "argmax": 0.0
+      }
+    }
+  ]
+}
