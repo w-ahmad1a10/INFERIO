@@ -36,7 +36,7 @@ def sample_clock_mhz():
             ["nvidia-smi", "--query-gpu=index,clocks.sm", "--format=csv,noheader"],
             capture_output=True, text=True, timeout=30)
         lines = r.stdout.strip().splitlines()
-        return int(lines[phys].split(",")[1])
+        return int(lines[phys].split(",")[1].strip().split()[0])
     except Exception:
         return 0
 
