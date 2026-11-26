@@ -1293,12 +1293,16 @@ extern "C" int inferio_prefill(const int32_t *host_ids, int batch, int seqlen,
                 if (cudaGraphInstantiate(&g_graphExec, g_graph, 0) != cudaSuccess) {
                     g_graphExec = nullptr;
                     g_graph_mode = false;
+                    std::printf("INFERIO_GRAPH instantiate failed, fallback direct\n");
                 } else {
                     g_graph_shape = shape;
+                    std::printf("INFERIO_GRAPH captured (batch=%d seq=%d group=%d)\n",
+                                batch, seqlen, group);
                 }
             } else {
                 g_graph = nullptr;
                 g_graph_mode = false;
+                std::printf("INFERIO_GRAPH capture failed rc=%d, fallback direct\n", crc);
             }
         } else if (g_graph_shape != (long long)batch * 1000000LL + seqlen + group) {
             cudaGraphExecDestroy(g_graphExec);
