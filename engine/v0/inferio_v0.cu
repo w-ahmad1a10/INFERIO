@@ -704,6 +704,152 @@ __global__ void attn_mma128_kernel(const __half *__restrict__ qkv, __half *__res
     }
 }
 
+// Variant: 256 threads (8 warps), 128 queries per block (INFERIO_ATTN=mma256).
+// Halves the block count (96 vs 192 at B=1) with the same warps/SM; targets
+// the tail-wave waste and per-block overhead at small batch.
+__global__ void attn_mma256_kernel(const __half *__restrict__ qkv, __half *__restrict__ out,
+                                   int seq, float scale_log2e) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int qc = blockIdx.x;
+    const int h = blockIdx.y;
+    const int gseq = blockIdx.z;
+    const long row_stride = kQKV;
+    const __half *qkv_g = qkv + (long)gseq * seq * row_stride + h * kHeadDim;
+
+    const int qrow0 = qc * 128 + warp * 16;
+    const int r = qrow0 + g;
+    const int r8 = r + 8;
+
+    unsigned qa[8][2];
+    {
+        // Q pre-scaled by scale_log2e at load (folds the per-tile score scaling
+        // into the mma inputs: (s*q)*k == s*(q*k) up to fp16 rounding).
+        const __half *p0 = qkv_g + (long)r * row_stride;
+        const __half *p8 = qkv_g + (long)r8 * row_stride;
+#pragma unroll
+        for (int dch = 0; dch < 8; ++dch) {
+            float2 q0 = __half22float2(*reinterpret_cast<const __half2 *>(p0 + dch * 8 + t * 2));
+            float2 q8 = __half22float2(*reinterpret_cast<const __half2 *>(p8 + dch * 8 + t * 2));
+            qa[dch][0] = pack_half2(q0.x * scale_log2e, q0.y * scale_log2e);
+            qa[dch][1] = pack_half2(q8.x * scale_log2e, q8.y * scale_log2e);
+        }
+    }
+
+    float o[8][4];
+#pragma unroll
+    for (int n = 0; n < 8; ++n)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) o[n][i] = 0.f;
+
+    float m_r = -1e30f, m_r8 = -1e30f;
+    float l_r = 0.f, l_r8 = 0.f;
+
+    const int qmax = qrow0 + 15;
+    const int n_tiles = (qmax + 64) / 64;
+
+    // V tile staged in shared memory (stride 72 halves to avoid bank conflicts).
+    __shared__ __half attn_vs[64 * 72];
+
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        const int k0 = tile * 64;
+        for (int i = threadIdx.x; i < 64 * 64; i += blockDim.x) {
+            const int kk = i >> 6;
+            const int dd = i & 63;
+            attn_vs[kk * 72 + dd] = qkv_g[(long)(k0 + kk) * row_stride + 2 * kD + dd];
+        }
+        __syncthreads();
+        float c[8][4];
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) c[kg][i] = 0.f;
+            const __half *kb = qkv_g + (long)(k0 + kg * 8 + g) * row_stride + kD;
+#pragma unroll
+            for (int dch = 0; dch < 8; ++dch) {
+                const unsigned b0 = *reinterpret_cast<const unsigned *>(kb + dch * 8 + t * 2);
+                mma_f16(c[kg], qa[dch][0], qa[dch][1], b0);
+            }
+        }
+
+        float tmax_r = -1e30f, tmax_r8 = -1e30f;
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+            const int col = k0 + kg * 8 + t * 2;
+            if (col > r) c[kg][0] = -1e30f;
+            if (col + 1 > r) c[kg][1] = -1e30f;
+            if (col > r8) c[kg][2] = -1e30f;
+            if (col + 1 > r8) c[kg][3] = -1e30f;
+            tmax_r = fmaxf(tmax_r, fmaxf(c[kg][0], c[kg][1]));
+            tmax_r8 = fmaxf(tmax_r8, fmaxf(c[kg][2], c[kg][3]));
+        }
+        tmax_r = fmaxf(tmax_r, __shfl_xor_sync(0xffffffffu, tmax_r, 1));
+        tmax_r = fmaxf(tmax_r, __shfl_xor_sync(0xffffffffu, tmax_r, 2));
+        tmax_r8 = fmaxf(tmax_r8, __shfl_xor_sync(0xffffffffu, tmax_r8, 1));
+        tmax_r8 = fmaxf(tmax_r8, __shfl_xor_sync(0xffffffffu, tmax_r8, 2));
+
+        const float mn_r = fmaxf(m_r, tmax_r);
+        const float mn_r8 = fmaxf(m_r8, tmax_r8);
+        const float corr_r = exp2f(m_r - mn_r);
+        const float corr_r8 = exp2f(m_r8 - mn_r8);
+
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            o[n][0] *= corr_r;
+            o[n][1] *= corr_r;
+            o[n][2] *= corr_r8;
+            o[n][3] *= corr_r8;
+        }
+
+        unsigned pa[8][2];
+        float sum_r = 0.f, sum_r8 = 0.f;
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+            const float p0 = exp2f(c[kg][0] - mn_r);
+            const float p1 = exp2f(c[kg][1] - mn_r);
+            const float p2 = exp2f(c[kg][2] - mn_r8);
+            const float p3 = exp2f(c[kg][3] - mn_r8);
+            sum_r += p0 + p1;
+            sum_r8 += p2 + p3;
+            pa[kg][0] = pack_half2(p0, p1);
+            pa[kg][1] = pack_half2(p2, p3);
+        }
+        sum_r += __shfl_xor_sync(0xffffffffu, sum_r, 1);
+        sum_r += __shfl_xor_sync(0xffffffffu, sum_r, 2);
+        sum_r8 += __shfl_xor_sync(0xffffffffu, sum_r8, 1);
+        sum_r8 += __shfl_xor_sync(0xffffffffu, sum_r8, 2);
+        l_r = l_r * corr_r + sum_r;
+        l_r8 = l_r8 * corr_r8 + sum_r8;
+        m_r = mn_r;
+        m_r8 = mn_r8;
+
+#pragma unroll
+        for (int kg = 0; kg < 8; ++kg) {
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                __half2 h2 = __halves2half2(attn_vs[(kg * 8 + t * 2) * 72 + n * 8 + g],
+                                            attn_vs[(kg * 8 + t * 2 + 1) * 72 + n * 8 + g]);
+                const unsigned b0 = *reinterpret_cast<unsigned *>(&h2);
+                mma_f16(o[n], pa[kg][0], pa[kg][1], b0);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv_r = l_r > 0.f ? 1.f / l_r : 0.f;
+    const float inv_r8 = l_r8 > 0.f ? 1.f / l_r8 : 0.f;
+    __half *orow = out + (long)gseq * seq * kD + h * kHeadDim;
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+        orow[(long)r * kD + n * 8 + t * 2] = __float2half(o[n][0] * inv_r);
+        orow[(long)r * kD + n * 8 + t * 2 + 1] = __float2half(o[n][1] * inv_r);
+        orow[(long)r8 * kD + n * 8 + t * 2] = __float2half(o[n][2] * inv_r8);
+        orow[(long)r8 * kD + n * 8 + t * 2 + 1] = __float2half(o[n][3] * inv_r8);
+    }
+}
+
 __global__ void gather_last_kernel(const __half *__restrict__ xn, __half *__restrict__ hlast,
                                    int g0, int seq, int D) {
     const int si = blockIdx.x;
@@ -1134,8 +1280,9 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
         else if (std::strcmp(aenv, "tiled") == 0) g_attn_mode = 1;
         else if (std::strcmp(aenv, "mma") == 0) g_attn_mode = 2;
         else if (std::strcmp(aenv, "mma128") == 0) g_attn_mode = 3;
+        else if (std::strcmp(aenv, "mma256") == 0) g_attn_mode = 4;
     }
-    const char *attn_names[4] = {"simple", "tiled", "mma", "mma128"};
+    const char *attn_names[5] = {"simple", "tiled", "mma", "mma128", "mma256"};
     std::printf("INFERIO_INIT attn=%s\n", attn_names[g_attn_mode]);
     std::fflush(stdout);
 
