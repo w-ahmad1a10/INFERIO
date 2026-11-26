@@ -1274,7 +1274,7 @@ extern "C" int inferio_init(const char *model_dir, int gpu_index) {
     if (g_heur_idx < 0) g_heur_idx = 0;
 
     const char *aenv = std::getenv("INFERIO_ATTN");
-    g_attn_mode = 2; /* default: PTX mma tensor-core attention */
+    g_attn_mode = 4; /* B=1 campaign default: mma256 (128 queries/block); INFERIO_ATTN=mma restores v0.12 behavior */
     if (aenv) {
         if (std::strcmp(aenv, "simple") == 0) g_attn_mode = 0;
         else if (std::strcmp(aenv, "tiled") == 0) g_attn_mode = 1;
